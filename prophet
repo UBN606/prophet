@@ -1,0 +1,13 @@
+#!/bin/sh
+# Prophet launcher: runs prophet.py next to this file (follows symlinks). Run `chmod +x prophet` once.
+src="$0"
+while [ -h "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+here=$(cd -P "$(dirname "$src")" && pwd)
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 -B "$here/prophet.py" "$@"
+fi
+exec python -B "$here/prophet.py" "$@"

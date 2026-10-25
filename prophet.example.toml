@@ -1,0 +1,14 @@
+# Prophet settings. Copy this file to prophet.toml (next to prophet.py, or inside your data folder) and edit.
+# Every line is optional: leave it commented out to keep the default.
+# Paths may use ~ and environment variables; a relative path is taken from the data folder.
+# Environment variables win over this file: PROPHET_HOME, and PROPHET_<KEY> for any key below.
+
+# Where Prophet keeps everything it writes. Default: ~/prophet-data
+# home = "~/prophet-data"
+
+[paths]
+# notebooks     = "notebooks"               # harvested text, notes, every skill's output and the search index (`ask` reads it)
+# local         = "local"                   # Markdown transcripts of your own media (`ask` searches them)
+# films         = "films"                   # one folder per project; `ask` also searches each project's _scratch/search folder
+# ub_tools      = "ub-tools"                # folder with ub-search.js and ub-verify.js (`prophet ub`; the book text is not part of this repo)
+# gods_eye_view = "repos/gods-eye-view"     # optional local clone indexed by source_harvest.py

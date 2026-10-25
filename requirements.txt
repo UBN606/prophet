@@ -1,0 +1,5 @@
+# Python packages Prophet imports. It also needs Python 3.11+ (see README.md).
+numpy>=1.23.2
+
+# Optional: imported only by the skills named here. Remove the # to install.
+# certifi          # source_harvest.py: a CA bundle when the system has none
