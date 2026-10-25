@@ -24,7 +24,9 @@ import zlib
 # provider's own documentation tells programs to call exactly this API. We use the documented API endpoint only and never
 # crawl another page of the site. A URL skips the check only if ALL of these hold: https on the default port, no credentials
 # in the URL, the host spelled exactly as below, a path equal to the entry's path or (when the entry ends in "/") under it, no
-# dot segments, and every required query pair present. A redirect is a new URL and is matched again; one that leaves the
+# dot segments, and every required query pair present. A path segment written as * in an entry stands for exactly one non-empty
+# segment (an id inside one documented endpoint, such as the product in Coinbase's candles) and nothing more. A redirect is a
+# new URL and is matched again; one that leaves the
 # list is robots-checked like any other. Everything not listed here still obeys robots.txt. Politeness is unchanged: the
 # same User-Agent, the same gap between requests to one site, the same timeout and size caps.
 # An endpoint belongs here only if it is an official, documented API. A download link on a website (a CSV button, a data
@@ -45,6 +47,11 @@ API_ALLOWLIST = (
     ("query.wikidata.org", "/sparql", {"format": "json"}, "https://www.mediawiki.org/wiki/Wikidata_Query_Service/User_Manual"),
     ("en.wikipedia.org", "/api/rest_v1/", {}, "https://en.wikipedia.org/api/rest_v1/"),
     ("api.gdeltproject.org", "/api/v2/doc/doc", {}, "https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/"),
+    # project decision: the two official, documented data APIs the sources api_openf1 and
+    # api_coinbase_candles read. Only the endpoint each source uses; every other path on these hosts goes through robots.txt.
+    ("api.openf1.org", "/v1/sessions", {}, "https://openf1.org/docs/"),
+    ("api.exchange.coinbase.com", "/products/*/candles", {},
+     "https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-candles"),
 )
 
 
@@ -65,7 +72,11 @@ def api_entry(parts):
     query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
     for entry in API_ALLOWLIST:
         entry_host, entry_path, required, _documentation = entry
-        under = path == entry_path or (entry_path.endswith("/") and path.startswith(entry_path))
+        if "*" in entry_path.split("/"):                    # one documented endpoint with an id in it: every other segment must match exactly
+            shape = "/".join("[^/]+" if segment == "*" else re.escape(segment) for segment in entry_path.split("/"))
+            under = re.fullmatch(shape, path) is not None
+        else:
+            under = path == entry_path or (entry_path.endswith("/") and path.startswith(entry_path))
         if host == entry_host and under and all(query.get(name) == value for name, value in required.items()):
             return entry
     return None

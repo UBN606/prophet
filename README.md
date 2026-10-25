@@ -167,12 +167,13 @@ The Pattern Lab (`prophet lab`) is built so the record cannot flatter itself:
 7. **Polite to the sites it reads.** Every automatic download follows one rule, kept in `prophet_net.py` and used by both the
    source harvester and the Pattern Lab: the site's `robots.txt` (wildcards, Allow and Crawl-delay) must allow it. A
    `robots.txt` that cannot be read blocks the site (HTTP 429, any 5xx, a refusal such as 401 or 403, redirects that never
-   end); only a plain 404 or 410 means there are no restrictions. The one exception is a short, explicit allowlist (`API_ALLOWLIST`) of
-   official, documented API endpoints: the arXiv API, Open-Meteo, api.weather.gov, GDELT's DOC API and a few like them. Only an
-   exact API URL on that list skips the `robots.txt` check; no other page of those sites is ever fetched, and there is no
-   switch that overrides the rule. Both programs identify themselves, wait between requests to one site and cap what they take.
-   The Pattern Lab also keeps a local cache of what it downloaded, asks GDELT for no more than one request every 6.5 seconds,
-   and when GDELT answers HTTP 429 it waits 10 seconds, asks once more and then stops with a clear error.
+   end); only a plain 404 or 410 means there are no restrictions. The one exception is a short, explicit allowlist
+   (`API_ALLOWLIST`) of official, documented API endpoints: the arXiv API, Open-Meteo, api.weather.gov, GDELT's DOC API,
+   OpenF1's sessions and Coinbase's public candles, and a few like them. Only an exact API URL on that list skips the
+   `robots.txt` check; no other page of those sites is ever fetched, and there is no switch that overrides the rule. Both
+   programs identify themselves, wait between requests to one site and cap what they take. The Pattern Lab also keeps a
+   local cache of what it downloaded, asks GDELT for no more than one request every 6.5 seconds, and when GDELT answers
+   HTTP 429 it waits 10 seconds, asks once more and then stops with a clear error.
 8. **A check that could not run is a failure.** Machine flags are pointers to look at, never approvals.
 
 ## The source list

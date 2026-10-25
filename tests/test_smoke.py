@@ -165,7 +165,9 @@ class Harvester(unittest.TestCase):
                     "https://api.open-meteo.com/v1/forecast?latitude=1&longitude=2",
                     "https://api.weather.gov/points/40.7,-74.0",
                     "https://www.loc.gov/search/?q=x&fo=json",
-                    "https://api.gdeltproject.org/api/v2/doc/doc?query=x&mode=timelinevol"):
+                    "https://api.gdeltproject.org/api/v2/doc/doc?query=x&mode=timelinevol",
+                    "https://api.openf1.org/v1/sessions?year=2024&session_type=Race",
+                    "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400"):
             self.assertTrue(listed(url), url)
         for url in ("https://export.arxiv.org/abs/2101.00001",           # another page of a listed site
                     "http://export.arxiv.org/api/query",                   # not https
@@ -178,8 +180,39 @@ class Harvester(unittest.TestCase):
                     "https://export.arxiv.org:8443/api/query",            # another port
                     "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500",   # a download link of a website is not an API
                     "https://www.football-data.co.uk/fixtures.csv",
+                    "https://api.openf1.org/v1/laps?session_key=1",         # another endpoint on a listed host
+                    "https://api.openf1.org/v1/sessions/extra",
+                    "https://api.openf1.org/",
+                    "https://api.exchange.coinbase.com/products/BTC-USD/book",
+                    "https://api.exchange.coinbase.com/products/BTC-USD/candles/extra",
+                    "https://api.exchange.coinbase.com/products//candles",   # the * stands for one real segment
+                    "https://api.exchange.coinbase.com/orders",
+                    "https://www.coinbase.com/products/BTC-USD/candles",     # the website, not the API host
                     "https://example.com/api/query"):
             self.assertFalse(listed(url), url)
+
+    def test_openf1_and_coinbase_skip_robots_txt_only_for_their_own_endpoint(self):
+        sh = load("source_harvest")
+        robots_reads, requests = [], []
+        original = sh.fetch_robots, sh.Http._request
+        sh.fetch_robots = lambda origin, user_agent, **kwargs: (robots_reads.append(origin) or (403, ""))      # these sites refuse robots.txt
+        sh.Http._request = lambda self, url, accept, max_bytes: (requests.append(url) or (200, {}, b"[]", False, 0.0))
+        try:
+            for host, listed, other in (("api.openf1.org", "/v1/sessions?year=2024&session_type=Race", "/v1/laps?session_key=1"),
+                                        ("api.exchange.coinbase.com", "/products/BTC-USD/candles?granularity=86400", "/products/BTC-USD/book")):
+                with self.subTest(host=host):
+                    robots_reads.clear()
+                    requests.clear()
+                    client = sh.Http(gap=0.0)
+                    self.assertEqual(client.get("https://" + host + listed).status, 200)
+                    self.assertEqual((robots_reads, requests), ([], ["https://" + host + listed]))       # on the list: robots.txt is not read
+                    with self.assertRaises(sh.FetchError) as caught:                                       # not on the list: it is, and it blocks
+                        client.get("https://" + host + other)
+                    self.assertEqual(caught.exception.kind, "robots")
+                    self.assertEqual(robots_reads, ["https://" + host])
+                    self.assertEqual(requests, ["https://" + host + listed])                                # the other path was never requested
+        finally:
+            sh.fetch_robots, sh.Http._request = original
 
     def test_harvester_and_lab_share_one_rule(self):
         net, sh, pl = load("prophet_net"), load("source_harvest"), load("prophet_lab")
@@ -398,8 +431,25 @@ class LabDownloads(unittest.TestCase):
     def test_an_official_api_on_the_list_needs_no_robots_txt(self):
         for url in ("https://archive-api.open-meteo.com/v1/archive?latitude=1&longitude=2",
                     "https://api.open-meteo.com/v1/forecast?latitude=1&longitude=2",
-                    "https://api.gdeltproject.org/api/v2/doc/doc?query=theme%3AX&mode=timelinevol&format=json&timespan=3m"):
+                    "https://api.gdeltproject.org/api/v2/doc/doc?query=theme%3AX&mode=timelinevol&format=json&timespan=3m",
+                    "https://api.openf1.org/v1/sessions?year=2024&session_type=Race",
+                    "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400"):
             self.assertEqual(self.lab._robots_basis(url, 0.0), ("official API (allowlist)", 0.0), url)   # decided with no request at all
+
+    def test_openf1_and_coinbase_other_paths_still_go_through_robots_txt(self):
+        net = load("prophet_net")
+        reads, original = [], net.fetch_robots
+        net.fetch_robots = lambda origin, user_agent, **kwargs: (reads.append(origin) or (403, ""))      # these sites refuse robots.txt
+        try:
+            for host, other in (("api.openf1.org", "/v1/laps?session_key=1"), ("api.exchange.coinbase.com", "/products/BTC-USD/book")):
+                with self.subTest(host=host):
+                    reads.clear()
+                    with self.assertRaises(self.pl.FetchError) as caught:
+                        self.lab._robots_basis("https://" + host + other, 0.0)
+                    self.assertIn("HTTP 403", str(caught.exception))
+                    self.assertEqual(reads, ["https://" + host])
+        finally:
+            net.fetch_robots = original
 
     def test_429_is_retried_once_for_gdelt_then_the_download_stops_cleanly(self):
         site = Site()
