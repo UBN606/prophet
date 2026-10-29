@@ -4,6 +4,8 @@
   prophet ub --ref 180:2.1 180:2.2         the exact paragraph text for a citation
   prophet ub prayer --with-notebooks       the same words also asked of your notebooks (ask)
   prophet ub prayer --json                 machine-readable (for other tools and agents)
+  prophet ub "how old is Urantia?"         a typed question gets the Studio's Ask answers (ub-ask.js), when the tool has it
+  prophet ub "how old is Urantia?" --words search the question's words instead of asking
 
 All book text comes from the local book search tool (ub-search.js, run with node). Nothing is quoted from memory,
 nothing is paraphrased, no network, no model, no GPU. Search results are re-read with --ref so every passage is the
@@ -25,6 +27,7 @@ HOME = Path(__file__).resolve().parent
 UB_DIR = pcfg.UB_TOOLS
 UB_SEARCH = UB_DIR / "ub-search.js"
 UB_VERIFY = UB_DIR / "ub-verify.js"
+UB_ASK = UB_DIR / "ub-ask.js"            # optional: the Studio's question answerer (newer copies of the book tools)
 
 REF_RE = re.compile(r"^\d{1,3}:\d{1,2}\.\d{1,3}$")
 FOUND_RE = re.compile(r"^Found (\d+) results\.")
@@ -139,6 +142,17 @@ def ub_search(query, limit=5, paper=None):
     return total, ub_get(refs)
 
 
+def ub_ask(question, limit=5):
+    """The Studio's answers to a typed question, from `ub-ask.js` (same ### blocks as --ref, exact full text)."""
+    tool_files_ok()
+    if not UB_ASK.exists():
+        raise UbError("book tool missing: " + str(UB_ASK))
+    code, out, err = run_node([str(UB_ASK), question, "--max", str(max(1, min(limit, 15)))])
+    if code not in (0, 1):   # exit 1 only means no passages were found
+        raise UbError("ub-ask.js failed (exit " + str(code) + "): " + (err.strip() or out.strip())[:300])
+    return [p for p in parse_ref_output(out) if "error" not in p]
+
+
 # Used to rank candidate paragraphs for many text windows in ONE node run (the tool's own search
 # function, loaded as a library). Only rankings come from here; the words always come from ub_get().
 RANK_JS = (
@@ -205,6 +219,7 @@ def main(argv=None):
     parser.add_argument("--with-notebooks", action="store_true", help="also ask your notebooks (harvested sources, transcripts, notes) the same words")
     parser.add_argument("--notebooks-n", type=int, default=5, help="how many notebook results with --with-notebooks (default 5)")
     parser.add_argument("--json", action="store_true", help="JSON output for other tools and agents")
+    parser.add_argument("--words", action="store_true", help="search the words of a typed question instead of asking it (ub-ask.js)")
     args = parser.parse_args(argv)
 
     refs = list(args.ref or [])
@@ -227,8 +242,12 @@ def main(argv=None):
                 code = 1
         if question:
             used = clean_question(question)
-            total, found = ub_search(used, args.limit, args.paper)
-            report["search"] = {"searched": used, "total_found": total, "shown": len(found), "passages": found}
+            if used != question and not args.words and args.paper is None and UB_ASK.exists():
+                found = ub_ask(question, args.limit)   # a sentence, not a phrase: the Studio's answers
+                report["search"] = {"searched": "the Studio's Ask (ub-ask.js)", "total_found": len(found), "shown": len(found), "passages": found}
+            else:
+                total, found = ub_search(used, args.limit, args.paper)
+                report["search"] = {"searched": used, "total_found": total, "shown": len(found), "passages": found}
         if args.with_notebooks and (question or refs):
             report["notebooks"] = notebook_hits(question or " ".join(refs), args.notebooks_n)
     except UbError as error:
