@@ -1,23 +1,22 @@
-"""Prophet: finds the exact moment in what you have collected, and calls what comes next with an honest track record.
+"""Prophet is a receipt book for predictions: make the call, lock it in, get graded.
 
-  prophet                      what Prophet can do, and what is proven
-  prophet ask <question>       search everything Prophet knows (time-coded links)
+  prophet                      what Prophet can do
+  prophet lab call ...         make a call and lock it in (`prophet lab resolve` grades it, `prophet lab record` shows the record)
+  prophet ask <question>       search the notes and transcripts you collected (a link and a snippet for each answer)
   prophet <skill> [args]       run a skill; `prophet <skill> --help` for its options
 """
-import json
 import subprocess
 import sys
 from pathlib import Path
 
 HOME = Path(__file__).resolve().parent
 PY = sys.executable
-STATUS = HOME / "prophet_status.json"
 
 # skill: (script, extra leading args, one-line description)
 SKILLS = {
-    "ask":       ("ask.py", [], "Search every transcript, note and finding; answers carry a time code or path:line"),
-    "ub":        ("prophet_ub.py", [], "Urantia Book passages with exact citations from a local book tool you provide, plus your own notebooks"),
-    "lab":       ("prophet_lab.py", [], "Pattern Lab: sealed calls on sports, weather, markets, anything; scored against a baseline"),
+    "ask":       ("ask.py", [], "Search the transcripts, notes and findings you collected; each answer shows a link and a snippet"),
+    "ub":        ("prophet_ub.py", [], "Exact Urantia Book passages with citations, read by the UB tools on your computer, plus your own notebooks"),
+    "lab":       ("prophet_lab.py", [], "Make the call, lock it in, get graded: sealed predictions on anything, scored against the obvious guess"),
 }
 
 
@@ -28,17 +27,10 @@ def installed():
 
 
 def card():
-    status = {}
-    if STATUS.exists():
-        try:
-            status = json.loads(STATUS.read_text(encoding="utf-8"))
-        except ValueError:
-            pass
     print("PROPHET\n")
     for name, (script, _, desc) in installed().items():
-        state = status.get(name, {}).get("state", "proven" if name in ("ask",) else "building")
-        print(f"  {name:11} {state:13} {desc}")
-    print("\n  prophet <skill> --help   for options.  Machine flags are worth a look, never an approval.")
+        print(f"  {name:11} {desc}")
+    print("\n  prophet <skill> --help   for options.")
 
 
 def main():

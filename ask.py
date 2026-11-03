@@ -1,10 +1,10 @@
-"""Search everything Prophet has harvested or transcribed: answers with channel, video, timestamp and a link
-that opens the video at that moment. Local files only; no network, no model, no GPU.
+"""Search the notes, transcripts and findings you collected. Each answer shows the channel and title (with a time code
+when there is one), a link and a snippet. Local files only; no network, no model, no GPU.
 
-  ask camera moves for game animation
-  ask --channel muska blender mcp
-  ask -n 20 seedance prompt
-  ask --json "kling vs seedance"      (machine-readable, for other agents)
+  ask picnic weather
+  ask --channel my-notes radar
+  ask -n 20 weather
+  ask --json "home advantage"         (machine-readable, for other programs)
   ask --stats
 """
 import argparse
@@ -215,7 +215,7 @@ def main(argv=None):
     if args.stats or not args.query:
         stats(index)
         if not args.query:
-            print('\nUsage: ask <question>    e.g.  ask camera moves for game animation')
+            print('\nUsage: ask <question>    e.g.  ask picnic weather')
         return 0
     query = " ".join(args.query)
     results = search(index, query, args.channel, args.n)

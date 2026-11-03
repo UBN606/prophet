@@ -52,6 +52,11 @@ API_ALLOWLIST = (
     ("api.openf1.org", "/v1/sessions", {}, "https://openf1.org/docs/"),
     ("api.exchange.coinbase.com", "/products/*/candles", {},
      "https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-candles"),
+    # OpenTimestamps public calendar servers (the Pattern Lab's `anchor` command). Not a download: one POST of a 32-byte hash to
+    # /digest, which is how the official OpenTimestamps client submits a hash to a calendar (RemoteCalendar.submit). They have no
+    # web pages to crawl, and a robots.txt means nothing for a hash submission. Only these two exact /digest URLs are listed.
+    ("a.pool.opentimestamps.org", "/digest", {}, "https://github.com/opentimestamps/opentimestamps-server"),
+    ("b.pool.opentimestamps.org", "/digest", {}, "https://github.com/opentimestamps/opentimestamps-server"),
 )
 
 

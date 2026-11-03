@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""Prophet Pattern Lab.
+"""Prophet Pattern Lab: make the call, lock it in, get graded.
 
-Learns patterns from past records, seals each prediction (a "pattern call") before the
-outcome is known, then scores it against what really happened and against a plain
-baseline. It publishes a track record, wins and misses included.
+The lab writes a prediction down (a "call") before the outcome is known, locks it with a seal,
+then grades it against what really happened and against the obvious guess (the "lazy guess").
+It keeps a record, wins and misses together.
 
-  prophet lab backtest <domain|all>   replay history walk-forward (only data before each date)
-  prophet lab predict  <domain|all>   seal live pattern calls for things that have not happened yet
-  prophet lab score                   score sealed calls whose outcome is now known
-  prophet lab call ...                seal a call on any question by hand (any domain)
-  prophet lab resolve <id> --outcome  score a hand-made call
+  Commands that never touch the network (they read and write the lab folder only):
+  prophet lab call ...                lock in a call on any question by hand (any domain)
+  prophet lab resolve <id> --outcome  grade a hand-made call
+  prophet lab list                    list the calls
   prophet lab verify                  check every seal; a broken seal is reported as TAMPERED
   prophet lab record                  write RECORD.md and record.html
   prophet lab domains                 what each domain is, and whether it has a free data source
+
+  Commands that download public data (each site's robots.txt is checked first):
+  prophet lab backtest <domain|all>   practice run: replay history, using only data from before each date
+  prophet lab predict  <domain|all>   lock in live calls for things that have not happened yet
+  prophet lab score                   grade locked calls whose outcome is now in the data
+
+  Command that sends one hash to the internet:
+  prophet lab anchor                  send the chain head (32 bytes, nothing else) to two OpenTimestamps
+                                      servers, so the date can be proved later. --dry-run sends nothing.
 
 Pattern research only. No bets, no trades, no investment advice. Free public data, no keys.
 """
@@ -23,6 +31,7 @@ import csv
 import datetime as dt
 import hashlib
 import html
+import http.client
 import importlib.util
 import io
 import json
@@ -112,6 +121,16 @@ def atomic_write(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
+    os.replace(tmp, path)
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
@@ -272,8 +291,9 @@ class Fetched(SimpleNamespace):
 
 
 class Lab:
-    def __init__(self, root=None, calls=None, scores=None, ttl_hours: float = 6.0):
+    def __init__(self, root=None, calls=None, scores=None, ttl_hours: float = 6.0, opts=None):
         self.root = Path(root or os.environ.get("PROPHET_LAB_DIR") or DEFAULT_LAB)
+        self.opts = dict(opts or {})       # per-run switches from the command line that a domain may read (geopolitics: days, gdelt_doc_api)
         self.calls_path = Path(calls) if calls else self.root / "calls.jsonl"
         self.scores_path = Path(scores) if scores else self.root / "scores.jsonl"
         self.raw_dir = self.root / "raw"
@@ -469,7 +489,7 @@ class Lab:
                 if e.code in (400, 401, 403, 404, 410, 451):
                     raise FetchError(f"HTTP {e.code} from {url}: {body}", code=e.code)
                 last_err = f"HTTP {e.code} {body}"
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as e:       # HTTPException: a body cut short (IncompleteRead)
                 last_err = str(getattr(e, "reason", e))
             time.sleep(2.0 * (attempt + 1))
         raise FetchError(f"could not fetch {url}: {last_err}")
@@ -607,7 +627,15 @@ class Verification:
                 wantb = score_pair(rec["kind"], rec["baseline_prediction"], float(row["outcome"]))
                 if abs(wantb - float(row["baseline_score"])) > 1e-9:
                     self.score_problems.append((row["_line"], cid, "baseline_score does not match outcome"))
-            except (KeyError, TypeError, ValueError):
+                for name, info in (row.get("late_baselines") or {}).items():       # yardsticks added at grading: only ones the call named, and they must add up
+                    p = float(info["p"])
+                    if name not in (rec.get("late_baselines") or []):
+                        self.score_problems.append((row["_line"], cid, f"score row carries the baseline '{name}', which the call never named"))
+                    elif abs(score_pair(rec["kind"], p, float(row["outcome"])) - float(row["baseline_scores"][name])) > 1e-9:
+                        self.score_problems.append((row["_line"], cid, f"baseline_scores['{name}'] does not match its stored chance and the outcome"))
+                    elif info.get("odds") and abs(devig3(info["odds"])[0] - p) > 2e-6:
+                        self.score_problems.append((row["_line"], cid, f"late baseline '{name}': the stored chance is not what its odds imply"))
+            except (KeyError, TypeError, ValueError, AttributeError, ZeroDivisionError):
                 self.score_problems.append((row["_line"], cid, "score row is incomplete"))
 
     @property
@@ -673,7 +701,9 @@ def append_score(lab: Lab, row: dict) -> None:
         append_line(lab.scores_path, row)
 
 
-def make_score_row(call: dict, outcome: float, scored_at: dt.datetime, how: str, evidence=None, note: str = "") -> dict:
+def make_score_row(call: dict, outcome: float, scored_at: dt.datetime, how: str, evidence=None, note: str = "", late=None) -> dict:
+    """late: {name: {"p": chance, "odds": [...]}}, yardsticks the call named in late_baselines that exist only now (a closing line).
+    Each is scored like any baseline, and when there is one the first becomes this call's primary baseline in the record."""
     kind = call["kind"]
     sc = score_pair(kind, call["prediction"], outcome)
     bs = {k: score_pair(kind, v, outcome) for k, v in (call.get("baselines") or {}).items()}
@@ -683,6 +713,15 @@ def make_score_row(call: dict, outcome: float, scored_at: dt.datetime, how: str,
         "baseline_scores": {k: round(v, 9) for k, v in bs.items()},
         "scored_at": iso(scored_at), "how": how,
     }
+    if late:
+        row["late_baselines"] = {}
+        for name, info in late.items():
+            entry = {"p": round(float(info["p"]), 6)}
+            if info.get("odds"):
+                entry["odds"] = [float(x) for x in info["odds"]]
+            row["late_baselines"][name] = entry
+            row["baseline_scores"][name] = round(score_pair(kind, entry["p"], outcome), 9)
+        row["primary_baseline"] = next(iter(row["late_baselines"]))
     if evidence:
         row["evidence"] = evidence
     if note:
@@ -784,6 +823,8 @@ class Adapter:
     sources: list = []              # [{"name", "url", "note"}]
     default_config: dict = {}
     plugin_file = None              # set by the loader for drop-in files
+    grades_manual_calls = False     # True: `score` also hands this domain the hand-made calls (origin manual, made with `call`) that carry its name;
+                                    # False (the default): `score` leaves them for `resolve`, exactly as before
 
     def config(self, lab: Lab) -> dict:
         return lab.cfg.get(self.name, self.default_config)
@@ -831,7 +872,9 @@ class Adapter:
         return {"rows": rows, "inputs": list(getattr(hist, "inputs", [])), "notes": list(getattr(hist, "notes", []))}
 
     def resolve_calls(self, lab: Lab, calls: list) -> dict:
-        """Outcomes for sealed calls: {id: (outcome or None, evidence inputs)}."""
+        """Outcomes for sealed calls: {id: (outcome or None, evidence inputs)}. An adapter with late_baselines (yardsticks that only exist
+        after the event, such as a closing price, named in the call when it is sealed) may add a third item for the calls whose data has
+        them: {name: {"p": chance, "odds": [...]}}. A call that did not name a yardstick never gets one."""
         hist = self.fetch_history(lab, fresh=True)
         return {c["id"]: (self.resolve(hist, call_subject(c)), self.evidence(hist, call_subject(c))) for c in calls}
 
@@ -1165,6 +1208,38 @@ def fd_date(s: str):
     return None
 
 
+# The market's own chance of a home win, used only to GRADE a call, never to make one. football-data.co.uk lists each bookmaker's
+# closing odds (the price just before kick-off) as three columns: home, draw, away. Pinnacle is the sharpest public price.
+# In the files read on 2026-10-25 the seasons 2021-22 to 2024-25 carry Pinnacle's closing odds for every match, 2025-26 for about
+# half of them, and 2026-27 for none: a match without them has no closing line and is never given a made-up one.
+CLOSE_LINES = {"pinnacle_close": ("PSCH", "PSCD", "PSCA")}
+MAX_BOOK = 1.25                  # 1/home + 1/draw + 1/away; below 1 or above this is not a real price list, so the row gets no closing line
+
+
+def devig3(odds) -> list:
+    """The chances three decimal odds imply: 1/odds, scaled so the three add up to 1. That takes the bookmaker's margin out."""
+    inv = [1.0 / float(x) for x in odds]
+    total = sum(inv)
+    return [v / total for v in inv]
+
+
+def odds3(row: dict, cols):
+    """(home, draw, away) decimal odds from one CSV row, or None when one is blank, not a number or not above 1, or the book is not plausible."""
+    try:
+        odds = tuple(float(row.get(c)) for c in cols)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(x) and x > 1.0 for x in odds):
+        return None
+    return odds if 1.0 <= sum(1.0 / x for x in odds) <= MAX_BOOK else None
+
+
+def closing_prob(m: dict, name: str = "pinnacle_close"):
+    """The market's chance that the home side wins, for one parsed match: the closing odds with the margin taken out. None when the file has none for it."""
+    odds = (m.get("close") or {}).get(name)
+    return None if odds is None else devig3(odds)[0]
+
+
 def parse_fd(text: str, season=None) -> list:
     out = []
     for r in csv.DictReader(io.StringIO(text)):
@@ -1177,9 +1252,14 @@ def parse_fd(text: str, season=None) -> list:
             hg, ag = int(r.get("FTHG")), int(r.get("FTAG"))
         except (TypeError, ValueError):
             hg = ag = None
+        close = {}
+        for name, cols in CLOSE_LINES.items():
+            odds = odds3(r, cols)
+            if odds is not None:
+                close[name] = odds
         out.append({"div": (r.get("Div") or "").strip(), "date": d, "time": (r.get("Time") or "").strip(),
                     "home": home, "away": away, "ftr": ftr if ftr in ("H", "D", "A") else "",
-                    "hg": hg, "ag": ag, "season": season})
+                    "hg": hg, "ag": ag, "season": season, "close": close})
     out.sort(key=lambda m: (m["date"], m["time"], m["home"]))
     return out
 
@@ -1284,8 +1364,10 @@ class SportsAdapter(Adapter):
     name = "sports"
     title = "Sports: football (soccer) home win yes/no"
     sources = [{"name": "football-data.co.uk results and fixtures CSVs", "url": "https://www.football-data.co.uk/data.php",
-                "note": "free historical results; credit football-data.co.uk. Prophet reads results only, never the bookmaker odds columns"}]
+                "note": "free historical results; credit football-data.co.uk. Prophet makes its calls from results only. Pinnacle's closing odds "
+                        "(PSCH, PSCD, PSCA) are read after the match, to grade a call against the market"}]
     default_config = DEFAULT_CONFIG["sports"]
+    late_baselines = ("pinnacle_close",)       # written into every NEW call; the closing odds do not exist yet when a call is sealed, so they are added when it is graded
 
     def fetch_history(self, lab, fresh=False):
         cfg = self.config(lab)
@@ -1321,17 +1403,27 @@ class SportsAdapter(Adapter):
 
     def backtest(self, lab):
         hist = self.fetch_history(lab)
-        rows, per_league = [], []
+        rows, per_league, unpriced = [], [], 0
         for div, ms in hist.matches.items():
             _, res = run_league(ms, True)
+            scored = 0
             for m, p, base in res:
+                q = closing_prob(m)
+                if q is None:               # no Pinnacle closing odds in the file for this match: there is nothing to grade it against
+                    unpriced += 1
+                    continue
                 rows.append({"target": "home_win", "kind": "binary", "key": f"{div}:{m['date'].isoformat()}:{m['home']}-{m['away']}",
-                             "as_of": m["date"].isoformat(), "pred": p, "bases": {"league_home_rate": base},
-                             "primary": "league_home_rate", "outcome": 1.0 if m["ftr"] == "H" else 0.0})
-            per_league.append(f"{div} {len(res)}")
-        notes = [f"Leagues and calls: {', '.join(per_league)}. Seasons {hist.seasons[0]} to {hist.seasons[-1]}; the first season of each league only warms the ratings up.",
+                             "as_of": m["date"].isoformat(), "pred": p, "bases": {"pinnacle_close": q, "league_home_rate": base},
+                             "primary": "pinnacle_close", "outcome": 1.0 if m["ftr"] == "H" else 0.0})
+                scored += 1
+            per_league.append(f"{div} {scored}")
+        if not rows:
+            raise LabError("sports: no match in the downloaded files has Pinnacle closing odds (PSCH, PSCD, PSCA), so the practice run has nothing to be graded against")
+        notes = [f"Leagues and calls: {', '.join(per_league)}. Seasons {hist.seasons[0]} to {hist.seasons[-1]}; the first season of each league only warms the ratings up."
+                 + (f" {unpriced} matches have no Pinnacle closing odds in their file (the newest files carry none) and are left out, not given a made-up price." if unpriced else ""),
                  "Pattern: Elo rating gap (K=20, goal-difference weighting, ratings pulled 25% toward average each new season) plus points in the last five matches, turned into a home-win probability by a ridge logistic refitted every 100 matches. Draws count as not a home win.",
-                 "Baseline: the league's home-win rate so far."] + hist.notes
+                 "Baselines: pinnacle_close (primary), Pinnacle's closing odds for the match with the bookmaker's margin taken out (1/odds, scaled so home, draw and away add up to 1); "
+                 "league_home_rate, the league's home-win rate so far. The call itself never uses odds: the closing odds are only the yardstick, and the closing price is the market's final answer, a hard one to be ahead of."] + hist.notes
         return {"rows": rows, "inputs": hist.inputs, "notes": notes}
 
     # ---- live: upcoming fixtures ----------------------------------------------------
@@ -1386,11 +1478,20 @@ class SportsAdapter(Adapter):
         for (div, season), cs in need.items():
             url = FD_RESULTS.format(season=season, div=div)
             f = lab.fetch(url, ttl=1800.0, validate=_validate_fd)
-            res = {(m["date"].isoformat(), m["home"], m["away"]): m["ftr"] for m in parse_fd(f.text(), season) if m["ftr"]}
+            res = {(m["date"].isoformat(), m["home"], m["away"]): m for m in parse_fd(f.text(), season) if m["ftr"]}
             for c in cs:
                 m = c["meta"]
-                r = res.get((m["date"], m["home"], m["away"]))
-                out[c["id"]] = (None if not r else (1.0 if r == "H" else 0.0), [{"url": url, "sha256": f.sha256}])
+                row = res.get((m["date"], m["home"], m["away"]))
+                evidence = [{"url": url, "sha256": f.sha256}]
+                if row is None:
+                    out[c["id"]] = (None, evidence)
+                    continue
+                late = {}                   # only the lines this call named when it was sealed, and only if the file has them for this match
+                for name in c.get("late_baselines") or []:
+                    odds = (row.get("close") or {}).get(name)
+                    if odds is not None:
+                        late[name] = {"p": devig3(odds)[0], "odds": list(odds)}
+                out[c["id"]] = (1.0 if row["ftr"] == "H" else 0.0, evidence, late or None)
         return out
 
 
@@ -1590,6 +1691,9 @@ def build_call(lab: Lab, adapter: Adapter, subject: dict, fc: dict, bl: dict, in
     }
     if adapter.plugin_file:
         rec["plugin_sha256"] = sha256_bytes(Path(adapter.plugin_file).read_bytes())
+    late = list(getattr(adapter, "late_baselines", ()) or ())
+    if late:                        # yardsticks that only exist after the event (a closing price): named now, so none can be picked once the result is known
+        rec["late_baselines"] = late
     return rec
 
 
@@ -1678,15 +1782,21 @@ def print_agg(label: str, agg: dict):
 # ---- live state: sealed calls joined with their scores ----------------------------------
 
 
-def live_state(lab: Lab, v: Verification | None = None) -> dict:
-    v = v or verify_lab(lab)
-    calls = v.log.ok_calls
+def valid_scores(v: Verification) -> dict:
+    """{call id: score row} for every score row that passed verification."""
     bad_lines = {line for line, _, _ in v.score_problems}
     scored = {}
     for row in v.scores:
         if row.get("_bad") or row["_line"] in bad_lines or not row.get("id"):
             continue
         scored[row["id"]] = row
+    return scored
+
+
+def live_state(lab: Lab, v: Verification | None = None) -> dict:
+    v = v or verify_lab(lab)
+    calls = v.log.ok_calls
+    scored = valid_scores(v)
     now = utcnow()
     groups = {}
     for c in calls:
@@ -1703,12 +1813,13 @@ def live_state(lab: Lab, v: Verification | None = None) -> dict:
                 g["next_due"] = due
             continue
         bases = dict(row.get("baseline_scores") or {})
-        prim = c.get("primary_baseline") or "baseline"
+        prim = row.get("primary_baseline") or c.get("primary_baseline") or "baseline"       # a closing line added at grading becomes the primary
         if prim not in bases:
             bases[prim] = row["baseline_score"]
+        late_p = ((row.get("late_baselines") or {}).get(prim) or {}).get("p")
         g["items"].append({"score": row["score"], "bases": bases, "primary": prim,
                            "row": {"key": c["id"], "as_of": c["made_at"][:10], "pred": c["prediction"],
-                                   "bases": {prim: c["baseline_prediction"]}, "outcome": row["outcome"]}})
+                                   "bases": {prim: c["baseline_prediction"] if late_p is None else late_p}, "outcome": row["outcome"]}})
     for g in groups.values():
         g["agg"] = aggregate(g["items"])
         ranked = sorted(g["items"], key=lambda it: it["bases"][it["primary"]] - it["score"])
@@ -1801,7 +1912,8 @@ def cmd_predict(lab, args):
             rec = append_call(lab, build_call(lab, ad, s, fc, bl, s.get("_inputs") or getattr(hist, "inputs", []), now))
             have.add(rec["id"])
             sealed += 1
-            print(f"  sealed {rec['id']}  call {rec['prediction']}  baseline {rec['baseline_prediction']} ({rec['primary_baseline']})  resolves {rec['resolves_at']}  seal {rec['seal'][:12]}")
+            later = f"  also graded against {', '.join(rec['late_baselines'])} once the result is in" if rec.get("late_baselines") else ""
+            print(f"  sealed {rec['id']}  call {rec['prediction']}  baseline {rec['baseline_prediction']} ({rec['primary_baseline']})  resolves {rec['resolves_at']}  seal {rec['seal'][:12]}{later}")
         for n in getattr(hist, "notes", []):
             if "skipped" in n or "filled" in n:
                 print(f"  note: {n}")
@@ -1823,11 +1935,13 @@ def cmd_score(lab, args):
     by_domain = {}
     manual = []
     for c in due:
-        if c.get("origin") == "manual" or c["domain"] not in REGISTRY:
+        ad = REGISTRY.get(c["domain"])
+        if ad is None or (c.get("origin") == "manual" and not getattr(ad, "grades_manual_calls", False)):
             manual.append(c)
         else:
             by_domain.setdefault(c["domain"], []).append(c)
     scored = unresolved = problems = 0
+    no_line = {}                        # late yardstick name -> scored calls whose data had no such line for that event
     for dom, cs in by_domain.items():
         ad = REGISTRY[dom]
         try:
@@ -1837,15 +1951,23 @@ def cmd_score(lab, args):
             print(f"[{dom}] could not read outcomes: {e}")
             continue
         for c in cs:
-            outcome, evidence = results.get(c["id"], (None, []))
+            got = results.get(c["id"], (None, []))
+            outcome, evidence = got[0], got[1]
+            late = got[2] if len(got) > 2 else None       # yardsticks that exist only after the event (a closing line), see make_score_row
             if outcome is None:
                 unresolved += 1
                 print(f"  waiting {c['id']}: outcome not in the data yet")
                 continue
-            row = make_score_row(c, float(outcome), now, "auto", evidence=evidence)
+            row = make_score_row(c, float(outcome), now, "auto", evidence=evidence, late=late)
             append_score(lab, row)
             scored += 1
-            print(f"  scored {c['id']}: called {c['prediction']}, baseline {c['baseline_prediction']}, outcome {outcome:g}; score {row['score']:.4f} vs baseline {row['baseline_score']:.4f}")
+            extra = "".join(f"; {k} {v['p']:.4f} scores {row['baseline_scores'][k]:.4f}" for k, v in (row.get("late_baselines") or {}).items())
+            print(f"  scored {c['id']}: called {c['prediction']}, baseline {c['baseline_prediction']}, outcome {outcome:g}; score {row['score']:.4f} vs baseline {row['baseline_score']:.4f}{extra}")
+            for name in c.get("late_baselines") or []:
+                if name not in (row.get("late_baselines") or {}):
+                    no_line[name] = no_line.get(name, 0) + 1
+    for name, n in no_line.items():
+        print(f"{n} scored call(s) named the yardstick {name}, but their data has none for that event, so they were graded against the sealed baseline only.")
     if manual:
         print(f"{len(manual)} hand-made calls are past their date. Score each with: resolve <id> --outcome yes|no|<number>")
         for c in manual[:20]:
@@ -1877,14 +1999,24 @@ def parse_outcome(kind: str, text: str) -> float:
     return x
 
 
+def parse_resolves(text: str, today: dt.date) -> dt.date:
+    """The day a call resolves: YYYY-MM-DD, or the word today or tomorrow (a UTC date, like every date the lab keeps)."""
+    word = str(text).strip().lower()
+    if word == "today":
+        return today
+    if word == "tomorrow":
+        return today + dt.timedelta(days=1)
+    try:
+        return dt.date.fromisoformat(word)
+    except ValueError:
+        raise LabError("--resolves must be a date like 2026-12-31, or the word today or tomorrow (dates are UTC)")
+
+
 def cmd_call(lab, args):
     if (args.prob is None) == (args.value is None):
         raise LabError("give exactly one of --prob (yes/no call) or --value (number call)")
-    try:
-        resolves = dt.date.fromisoformat(args.resolves)
-    except ValueError:
-        raise LabError("--resolves must be a date like 2026-12-31")
     now = utcnow()
+    resolves = parse_resolves(args.resolves, now.date())
     if resolves < now.date():
         raise LabError("--resolves is in the past: a call must be sealed before its outcome")
     kind = "binary" if args.prob is not None else "number"
@@ -1977,6 +2109,391 @@ def cmd_domains(lab, args):
 
 
 # ======================================================================================
+# anchors: prove WHEN the record existed (OpenTimestamps)
+# ======================================================================================
+# A seal shows that nothing was edited since a call was made. It cannot show WHEN the call was made: the date is this computer's
+# clock. `anchor` sends the chain head (the seal of the newest call: a 32-byte SHA-256 that fingerprints the whole list) to two
+# public OpenTimestamps calendar servers. Each answers with a receipt that is "pending". Within hours the calendars commit it to
+# Bitcoin, and the official `ots` client can then upgrade the receipt into a proof that anyone can check. Only the 32 bytes leave
+# this computer: no question, number, file name or call. The calendar servers do see this computer's address and the time, as any
+# web server does.
+
+OTS_CALENDARS = ("https://a.pool.opentimestamps.org/digest", "https://b.pool.opentimestamps.org/digest")
+ANCHOR_UA = "ProphetLab/1.0 anchor"
+OTS_TIMEOUT = 30.0
+OTS_RETRY_WAIT = 2.0                 # seconds before the one retry (a network failure or an HTTP 5xx); tests make it short
+OTS_MAX_ANSWER = 20_000              # a calendar's answer is a few hundred bytes; anything bigger is not a receipt
+OTS_MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"      # the first bytes of every .ots file
+OTS_OPS = {0x02: "sha1", 0x03: "ripemd160", 0x08: "sha256", 0x67: "keccak256", 0xF2: "reverse", 0xF3: "hexlify"}     # no argument
+OTS_ARG_OPS = {0xF0: "append", 0xF1: "prepend"}                                                                      # one argument
+OTS_PENDING = bytes.fromhex("83dfe30d2ef90c8e")          # attestation: "this calendar will commit the hash to Bitcoin"
+OTS_BITCOIN = bytes.fromhex("0588960d73d71901")          # attestation: "this hash is in a Bitcoin block" (what `ots upgrade` adds)
+
+
+class _Bytes:
+    """A cursor over bytes. Reading past the end raises ValueError, so a cut-off answer can never parse."""
+
+    def __init__(self, data):
+        self.data, self.pos = bytes(data), 0
+
+    def take(self, n):
+        if n < 0 or self.pos + n > len(self.data):
+            raise ValueError("the data ends too early")
+        chunk = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return chunk
+
+    def byte(self):
+        return self.take(1)[0]
+
+    def varuint(self):
+        value = shift = 0
+        while True:
+            b = self.byte()
+            value |= (b & 0x7F) << shift
+            if not b & 0x80:
+                return value
+            shift += 7
+            if shift > 56:
+                raise ValueError("a number is too long")
+
+    def varbytes(self, limit, minimum=0):
+        n = self.varuint()
+        if n > limit or n < minimum:
+            raise ValueError("a length is out of range")
+        return self.take(n)
+
+    def at_end(self):
+        return self.pos == len(self.data)
+
+
+def _varuint_bytes(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def ots_read_node(r: _Bytes, depth: int = 0) -> dict:
+    """One node of an OpenTimestamps tree: {"atts": [(kind, payload)], "ops": [(op tag, argument, child node)]}. The layout is the
+    one the official client reads: items joined by a 0xff marker, the last item without one."""
+    if depth > 256:
+        raise ValueError("the receipt nests too deeply")
+    node = {"atts": [], "ops": []}
+    while True:
+        tag = r.byte()
+        more = tag == 0xFF
+        if more:
+            tag = r.byte()
+        if tag == 0x00:
+            node["atts"].append((r.take(8), r.varbytes(8192)))
+        elif tag in OTS_ARG_OPS:
+            argument = r.varbytes(4096, minimum=1)
+            node["ops"].append((tag, argument, ots_read_node(r, depth + 1)))
+        elif tag in OTS_OPS:
+            node["ops"].append((tag, b"", ots_read_node(r, depth + 1)))
+        else:
+            raise ValueError("unknown operation 0x%02x" % tag)
+        if not more:
+            return node
+
+
+def ots_write_node(node: dict) -> bytes:
+    items = [("att", a) for a in sorted(node["atts"])] + [("op", o) for o in sorted(node["ops"], key=lambda o: (o[0], o[1]))]
+    if not items:
+        raise ValueError("an empty node cannot be written")
+    out = bytearray()
+    for i, (kind, item) in enumerate(items):
+        if i < len(items) - 1:
+            out.append(0xFF)
+        if kind == "att":
+            out += b"\x00" + item[0] + _varuint_bytes(len(item[1])) + item[1]
+        else:
+            tag, argument, child = item
+            out.append(tag)
+            if tag in OTS_ARG_OPS:
+                out += _varuint_bytes(len(argument)) + argument
+            out += ots_write_node(child)
+    return bytes(out)
+
+
+def ots_merge(a: dict, b: dict) -> dict:
+    """Two receipts for the same hash, as one tree (what the official client does when it asks several calendars)."""
+    ops = {}
+    for tag, argument, child in a["ops"] + b["ops"]:
+        ops[(tag, argument)] = ots_merge(ops[(tag, argument)], child) if (tag, argument) in ops else child
+    return {"atts": sorted(set(a["atts"]) | set(b["atts"])), "ops": [(t, ar, c) for (t, ar), c in sorted(ops.items())]}
+
+
+def ots_attestations(node: dict):
+    for att in node["atts"]:
+        yield att
+    for _tag, _argument, child in node["ops"]:
+        yield from ots_attestations(child)
+
+
+def ots_parse(answer: bytes) -> dict:
+    """A calendar's answer: one whole OpenTimestamps tree for the submitted hash, holding at least one attestation. Anything else
+    (an HTML page from a proxy, a cut-off answer, trailing bytes) raises ValueError."""
+    r = _Bytes(answer)
+    node = ots_read_node(r)
+    if not r.at_end():
+        raise ValueError("extra bytes after the receipt")
+    if not list(ots_attestations(node)):
+        raise ValueError("the receipt holds no attestation")
+    return node
+
+
+def ots_pending_uris(node: dict) -> list:
+    """The calendar addresses that promised to commit the hash to Bitcoin."""
+    found = []
+    for kind, payload in ots_attestations(node):
+        if kind == OTS_PENDING:
+            try:
+                uri = _Bytes(payload).varbytes(1000).decode("ascii")
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if uri not in found:
+                found.append(uri)
+    return found
+
+
+def ots_bitcoin_blocks(node: dict) -> list:
+    """The Bitcoin block heights a receipt claims (present only after `ots upgrade`)."""
+    heights = []
+    for kind, payload in ots_attestations(node):
+        if kind == OTS_BITCOIN:
+            try:
+                heights.append(_Bytes(payload).varuint())
+            except ValueError:
+                continue
+    return sorted(set(heights))
+
+
+def ots_file(digest: bytes, node: dict) -> bytes:
+    """A detached timestamp file (.ots) for a SHA-256 digest, in the format of the official `ots` client."""
+    return OTS_MAGIC + _varuint_bytes(1) + bytes([0x08]) + digest + ots_write_node(node)
+
+
+def ots_read_file(data: bytes):
+    """(digest, tree) of a .ots file that stamps a SHA-256 digest; ValueError for anything else."""
+    r = _Bytes(data)
+    if r.take(len(OTS_MAGIC)) != OTS_MAGIC:
+        raise ValueError("not an OpenTimestamps file")
+    if r.varuint() != 1:
+        raise ValueError("an OpenTimestamps file of another major version")
+    if r.byte() != 0x08:
+        raise ValueError("the file stamps a digest that is not SHA-256")
+    digest = r.take(32)
+    node = ots_read_node(r)
+    if not r.at_end():
+        raise ValueError("extra bytes after the receipt")
+    return digest, node
+
+
+def ots_submit(url: str, digest: bytes, timeout: float = OTS_TIMEOUT):
+    """POST the raw digest to one calendar. Returns (HTTP status, body); an error status comes back as a value, not an exception.
+    A network failure raises FetchError. A redirect is never followed: the hash goes to the address that was checked, and nowhere else."""
+    request = urllib.request.Request(url, data=digest, method="POST", headers={
+        "User-Agent": ANCHOR_UA, "Accept": "application/vnd.opentimestamps.v1", "Content-Type": "application/octet-stream"})
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            return response.status, response.read(OTS_MAX_ANSWER + 1)
+    except urllib.error.HTTPError as error:
+        try:
+            body = error.read(300)
+        except Exception:
+            body = b""
+        finally:
+            error.close()
+        return error.code, body
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as error:
+        raise FetchError(f"could not reach {url}: {getattr(error, 'reason', None) or error}")
+
+
+def ots_ask(url: str, digest: bytes) -> dict:
+    """One calendar's answer, with at most one retry (after a network failure, an HTTP 429 or an HTTP 5xx). Any other status is final."""
+    answer = {"status": None, "body": b"", "error": "not asked"}
+    for attempt in range(2):
+        try:
+            status, body = ots_submit(url, digest, OTS_TIMEOUT)
+            answer = {"status": status, "body": body, "error": None}
+        except FetchError as e:
+            answer = {"status": None, "body": b"", "error": str(e)}
+        if answer["status"] is not None and answer["status"] < 500 and answer["status"] != 429:
+            break
+        if attempt == 0:
+            time.sleep(OTS_RETRY_WAIT)
+    return answer
+
+
+def ots_judge(answer: dict):
+    """(accepted, why not, tree) for one calendar's answer. Only an HTTP 200 whose body is a real receipt counts."""
+    if answer["error"]:
+        return False, answer["error"], None
+    if answer["status"] != 200:
+        return False, f"HTTP {answer['status']}", None
+    body = answer["body"]
+    if not body or len(body) > OTS_MAX_ANSWER:
+        return False, "HTTP 200 but the answer is empty or too large to be a receipt", None
+    try:
+        return True, "", ots_parse(body)
+    except ValueError as e:
+        return False, f"HTTP 200 but the body is not an OpenTimestamps receipt ({e})", None
+
+
+def anchor_log_path(lab: Lab) -> Path:
+    return lab.root / "anchors.jsonl"
+
+
+def read_anchor_log(lab: Lab) -> list:
+    rows = []
+    path = anchor_log_path(lab)
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def free_name(path: Path) -> Path:
+    """path, or path with -2, -3 ... before the extension when it exists: a receipt that was upgraded later is never overwritten."""
+    if not path.exists():
+        return path
+    n = 2
+    while True:
+        other = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        if not other.exists():
+            return other
+        n += 1
+
+
+def anchor_state(lab: Lab, v: Verification) -> dict:
+    """What the record says about anchors, from anchors.jsonl, the receipt file and the chain as it stands now.
+    state: never | current (the newest call is covered) | behind (newer calls exist) | foreign (the anchored head is not in this chain).
+    receipt: pending | bitcoin (the file claims a Bitcoin block; the `ots` client must check it) | missing | unreadable | mismatch."""
+    rows = [r for r in read_anchor_log(lab) if r.get("ok") and isinstance(r.get("head"), str)]
+    if not rows:
+        return {"state": "never"}
+    last = rows[-1]
+    seals = [e["rec"]["seal"] for e in v.log.entries if e["rec"] and e["rec"].get("seal")]
+    if last["head"] not in seals:
+        state, newer = "foreign", None
+    else:
+        newer = len(seals) - 1 - seals.index(last["head"])
+        state = "current" if newer == 0 else "behind"
+    receipt, blocks, uris = "missing", [], []
+    path = lab.root / str(last.get("file") or "")
+    if last.get("file") and path.is_file():
+        try:
+            digest, node = ots_read_file(path.read_bytes())
+            blocks, uris = ots_bitcoin_blocks(node), ots_pending_uris(node)
+            receipt = "mismatch" if digest.hex() != last["head"] else ("bitcoin" if blocks else "pending")
+        except (ValueError, OSError):
+            receipt = "unreadable"
+    ok = [c for c in last.get("calendars", []) if c.get("ok")]
+    return {"state": state, "date": last.get("date"), "head": last["head"], "file": last.get("file"), "newer": newer,
+            "calendars_ok": len(ok), "calendars_total": len(last.get("calendars", [])), "receipt": receipt,
+            "blocks": blocks, "calendar_uris": uris, "anchored_calls": last.get("calls"), "runs": len(rows)}
+
+
+def anchor_sentence(a: dict) -> str:
+    if a["state"] == "never":
+        return ("Not anchored yet. A seal shows that nothing was edited, but not when a call was made. "
+                "Run `prophet lab anchor` to get a dated receipt from OpenTimestamps.")
+    base = f"Last anchored on {a['date']} ({a['calendars_ok']} of {a['calendars_total']} calendars accepted the hash)."
+    if a["state"] == "foreign":
+        return (base + " WARNING: that chain head is not in this record. The record was changed after it was anchored, "
+                       "or this is a different record.")
+    where = ("The newest call is covered." if a["state"] == "current"
+             else f"{a['newer']} newer call{'s' if a['newer'] != 1 else ''} {'are' if a['newer'] != 1 else 'is'} not anchored yet.")
+    if a["receipt"] == "bitcoin":
+        blocks = ", ".join(str(b) for b in a["blocks"])
+        tail = f" The receipt file now claims Bitcoin block {blocks}. This page does not check that: use the `ots` client."
+    elif a["receipt"] == "pending":
+        tail = " Status: pending. The calendars hold the hash; Bitcoin has not been checked. Nothing is confirmed yet."
+    else:
+        tail = f" WARNING: the receipt file is {a['receipt']}."
+    return f"{base} {where}{tail}"
+
+
+def cmd_anchor(lab, args):
+    v = verify_lab(lab)
+    if not v.log.entries:
+        raise LabError("nothing is sealed yet, so there is no chain head to anchor. Seal a call first (`call` or `predict`).")
+    if not v.ok:
+        print_verification(v, per_call_limit=0)
+        raise LabError("the record fails verification, so it is not anchored: a date on a broken record proves nothing. "
+                       "Find the cause first (`verify`).")
+    head = v.log.head
+    digest = bytes.fromhex(head)
+    if len(digest) != 32:
+        raise LabError("the chain head is not a 32-byte SHA-256 hash")
+    for url in OTS_CALENDARS:
+        if net.api_entry(urllib.parse.urlsplit(url)) is None:
+            raise LabError(f"{url} is not on prophet_net.API_ALLOWLIST, so nothing is sent")
+    day = utcnow().strftime("%Y-%m-%d")
+    rel = f"anchors/{day}_{head[:12]}.ots-pending"
+    target = free_name(lab.root / rel)
+    print(f"Prophet anchor{' (dry run)' if args.dry_run else ''}")
+    print(f"Chain head (seal of the newest call): {head}")
+    print(f"Seal check: ALL SEALS OK ({len(v.log.entries)} sealed call{'' if len(v.log.entries) == 1 else 's'})")
+    if args.dry_run:
+        print(f"Would send {len(digest)} bytes, the chain head as raw bytes, with POST to:")
+        for url in OTS_CALENDARS:
+            print(f"  {url}")
+        print(f"Headers: User-Agent: {ANCHOR_UA}; Accept: application/vnd.opentimestamps.v1; Content-Type: application/octet-stream")
+        print("Only that hash leaves this computer: no question, no number, no file. The servers see this computer's address and the time.")
+        print(f"Would save the receipt as {target.relative_to(lab.root).as_posix()} and add one line to anchors.jsonl.")
+        print("Dry run: nothing was sent, and no receipt or anchors.jsonl line was written.")
+        return 0
+    earlier = [r for r in read_anchor_log(lab) if r.get("ok") and r.get("head") == head]
+    if earlier and not args.again:
+        print(f"This chain head was already anchored on {earlier[-1].get('date')} ({earlier[-1].get('file')}). Nothing is sent.")
+        print("Seal a new call to get a new chain head, or use --again to send this one a second time.")
+        return 0
+    results = []
+    for url in OTS_CALENDARS:
+        answer = ots_ask(url, digest)
+        ok, why, node = ots_judge(answer)
+        body = answer["body"] if ok else b""
+        results.append({"url": url, "ok": ok, "status": answer["status"], "bytes": len(body) if ok else len(answer["body"]),
+                        "sha256": sha256_bytes(body) if ok else None, "error": None if ok else why,
+                        "pending": ots_pending_uris(node) if ok else [], "_node": node})
+        print(f"  {url}  " + (f"HTTP {answer['status']}  {len(body)} bytes  sha256 {sha256_bytes(body)[:16]}  pending at {', '.join(results[-1]['pending']) or '(not named)'}"
+                              if ok else f"FAILED: {why}"))
+    good = [r for r in results if r["ok"]]
+    if not good:
+        raise LabError("no calendar accepted the hash, so nothing was saved. " + "; ".join(f"{r['url']}: {r['error']}" for r in results))
+    tree = good[0]["_node"]
+    for r in good[1:]:
+        tree = ots_merge(tree, r["_node"])
+    receipt = ots_file(digest, tree)
+    atomic_write_bytes(target, receipt)
+    entry = {"schema": "prophet-anchor/1", "date": day, "anchored_at": iso(utcnow()), "head": head, "calls": len(v.log.entries),
+             "file": target.relative_to(lab.root).as_posix(), "file_bytes": len(receipt), "file_sha256": sha256_bytes(receipt),
+             "calendars": [{k: r[k] for k in ("url", "ok", "status", "bytes", "sha256", "error", "pending")} for r in results],
+             "ok": True, "state": "pending"}
+    append_line(anchor_log_path(lab), entry)
+    for r in results:
+        if not r["ok"]:
+            print(f"WARNING: {r['url']} did not accept the hash ({r['error']}). The receipt below comes from the other calendar.")
+    print(f"Saved {target.relative_to(lab.root).as_posix()} ({len(receipt)} bytes) and one line in anchors.jsonl.")
+    print("Status: PENDING. The calendar servers hold the hash and will commit it to Bitcoin, usually within hours. Nothing is confirmed yet.")
+    print("Later: copy the receipt to a name ending in .ots, run `ots upgrade` on it (pip install opentimestamps-client), then `ots info`.")
+    return 0
+
+
+# ======================================================================================
 # the record: RECORD.md (ask format) and record.html
 # ======================================================================================
 
@@ -2002,7 +2519,9 @@ TEXT_EVIDENCE = (f"Evidence rule. A domain is shown as 'beats baseline' only whe
                  "With fewer scored calls nothing is claimed and the scores are printed anyway. Backtests (walk-forward replays where each call uses only data from before its date) and live sealed calls are kept in separate tables and are never mixed. "
                  "A backtest is a rehearsal; only live sealed calls are a track record.")
 TEXT_SEAL = ("What a seal proves. Any edit to a sealed call, a removed or reordered call, or a score that does not match its outcome is reported as TAMPERED by `verify`, and every command checks the seals when it reads the log. "
-             "A seal does not prove when the call was made (the clock is this computer's) and it cannot stop someone who rewrites the whole file and every hash; the chain head printed below is the line to copy somewhere outside this machine if that matters. "
+             "A seal alone does not prove when the call was made (the clock is this computer's) and it cannot stop someone who rewrites the whole file and every hash. "
+             "`anchor` closes that gap: it sends the chain head (a 32-byte hash, nothing else) to two public OpenTimestamps servers and keeps their receipt under anchors/. "
+             "The receipt is pending at first. After it is upgraded to a Bitcoin proof with the official `ots` client, anyone can check that the record existed by that date. Until then nothing is confirmed. "
              "The exact code that made a call is kept in code_snapshots/ under the code_sha256 stored in the call.")
 TEXT_PLUGIN = ("How to add a domain (plugin interface). A domain is one small adapter. Save a file named prophet_lab_<name>.py next to prophet_lab.py and the next run picks it up; no other file changes. "
                "The file starts with `import prophet_lab as lab`, defines `class Adapter(lab.Adapter)` with name, title, sources and status, and ends with `ADAPTER = Adapter()`. "
@@ -2011,9 +2530,9 @@ TEXT_PLUGIN = ("How to add a domain (plugin interface). A domain is one small ad
                "baseline(hist, subject, as_of, feats) returns {'primary': name, 'values': {name: value}}. resolve(hist, subject) returns the outcome (1 or 0 for yes/no, otherwise the number) or None while it is unknown. "
                "backtest_subjects(hist) lists past cases oldest first and live_subjects(hist, now) lists what to call right now; lab.make_subject builds each case. "
                "Free public data only, no keys, no scraping of sites that forbid it. If no free source exists, set status = 'needs_data_source' and the record shows that instead of a score. Heavy adapters may override backtest(lab) and resolve_calls(lab, calls).")
-TEXT_MANUAL = ("Any question without a data feed. `prophet lab call --domain <any name> --question \"...\" --resolves YYYY-MM-DD --prob 0.62 [--baseline 0.5]` seals a hand-made or agent-made call (use --value and --baseline for a number). "
+TEXT_MANUAL = ("Any question without a data feed. `prophet lab call --domain <any name> --question \"...\" --resolves YYYY-MM-DD --prob 0.62 [--baseline 0.5]` seals a hand-made or agent-made call (use --value and --baseline for a number; --resolves also takes today or tomorrow). "
                "When the answer is known, `prophet lab resolve <id> --outcome yes|no|<number>` scores it. Hand-made calls appear in the live table under their own domain with the target 'manual'.")
-TEXT_COMMANDS = ("Commands, all run as `prophet lab <command>` from any folder: backtest <domain|all>, predict <domain|all>, score, call, resolve <id> --outcome, verify, record, domains, list.")
+TEXT_COMMANDS = ("Commands, all run as `prophet lab <command>` from any folder: backtest <domain|all>, predict <domain|all>, score, call, resolve <id> --outcome, verify, record, domains, list, anchor [--dry-run].")
 
 
 def describe_agg(agg: dict) -> str:
@@ -2145,8 +2664,10 @@ def build_blocks(lab: Lab, live: dict, now: dt.datetime) -> list:
     B.append(("p", f"Integrity check at generation time: {len(v.log.entries)} sealed calls, {len(v.log.entries) - len(v.log.bad)} OK, {len(v.log.bad)} TAMPERED; {len(v.scores)} score rows, {len(v.score_problems)} problems. "
                    + ("Result: ALL SEALS OK." if bad == 0 else "Result: TAMPERED. Do not trust this record until the cause is understood.")
                    + f" Chain head (seal of the newest call): {v.log.head or '(empty log)'}."))
+    B.append(("p", "Anchor: " + anchor_sentence(anchor_state(lab, v))))
     B.append(("p", "Files in the pattern-lab folder: calls.jsonl (sealed calls, append only), scores.jsonl (scores, append only), backtest/ (summary json and every scored row as csv), "
-                   "raw/ (every download with its URL, fetch time and sha256 in raw/manifest.jsonl), code_snapshots/ (the exact code behind each seal), config.json (places, leagues and series, editable)."))
+                   "raw/ (every download with its URL, fetch time and sha256 in raw/manifest.jsonl), code_snapshots/ (the exact code behind each seal), config.json (places, leagues and series, editable), "
+                   "anchors/ and anchors.jsonl (OpenTimestamps receipts for chain heads, written by `anchor`)."))
     return B
 
 
@@ -2174,34 +2695,426 @@ def render_md(lab: Lab, blocks: list) -> str:
     return head + "\n\n".join(parts) + "\n"
 
 
-HTML_CSS = """:root{color-scheme:light dark;--bg:#fafaf7;--fg:#1d1d1b;--mute:#5d5d57;--line:#d8d8d0;--head:#ecece4}
-@media (prefers-color-scheme:dark){:root{--bg:#161715;--fg:#e8e8e2;--mute:#a4a49c;--line:#3a3b37;--head:#232420}}
-body{background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,Segoe UI,sans-serif;margin:0;padding:24px 16px}
-main{max-width:1100px;margin:0 auto}h1{font-size:1.7rem;margin:.2em 0}h2{font-size:1.2rem;margin:1.6em 0 .4em}
-p{margin:.6em 0;max-width:80ch}.wrap{overflow-x:auto}table{border-collapse:collapse;font-size:.88rem;min-width:100%}
-th,td{border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}th{background:var(--head)}
-pre{background:var(--head);padding:12px;overflow-x:auto;font-size:.85rem;border:1px solid var(--line)}"""
+# ---- record.html: the page people look at ---------------------------------------------------------------------------------
+# Built from the sealed files only (calls.jsonl, scores.jsonl, the practice summaries in backtest/, anchors.jsonl). Nothing on it is
+# typed by hand. One file: no scripts, no web fonts, nothing loaded from the internet.
+
+DOMAIN_NAMES = {"weather": "Weather", "sports": "Football", "markets": "Stock markets", "geopolitics": "World events",
+                "business": "Business", "racing": "Horse racing", "production": "Production"}
+PLAIN_BASELINE = {"persistence": "same as today", "climatology": "the usual for that date", "league_home_rate": "the league's usual home-win rate",
+                  "up_rate": "the usual up rate", "weekday_rate": "that weekday's usual rate",
+                  "coin flip": "a coin flip", "stated baseline": "the baseline you stated",
+                  "pinnacle_close": "Pinnacle's closing odds, margin taken out"}
+MARKET_LINES = frozenset(CLOSE_LINES)        # baselines that are a market's own price, not a lazy guess: the page does not call them one
+PLAIN_TARGET = {("weather", "tmax"): "Tomorrow's high temperature", ("weather", "rain"): "Will it rain tomorrow?",
+                ("sports", "home_win"): "Will the home team win?", ("geopolitics", "up_h2"): "Will an event type's share rise?"}
+TARGET_UNIT = {("weather", "tmax"): "degrees F"}
+VERDICT_WORDS = {"beats": ("Ahead of the lazy guess", "good"), "ahead_unclear": ("Ahead, but not a clear edge", "mid"),
+                 "mixed": ("Mixed: ahead of one lazy guess, not the other", "mid"), "behind": ("Not ahead of the lazy guess", "bad"),
+                 "too_few": ("Too early to say", "none"), "none": ("Nothing graded yet", "none")}
+GLOSSARY = [
+    ("Call", "A prediction written down before the answer is known: a chance for a yes or no question (like 70%), or a number."),
+    ("Seal", "A fingerprint (SHA-256) of the call, chained to the seal before it. Any later edit changes the fingerprint, and "
+             "`prophet lab verify` reports TAMPERED."),
+    ("Chain head", "The seal of the newest call. It fingerprints the whole list, so one line stands for the whole record."),
+    ("Anchor", "A dated receipt for the chain head from OpenTimestamps. A seal shows that nothing was edited. Only an anchor shows when."),
+    ("Lazy guess", "What a plain rule says with no thinking: 'same as today', 'the usual rate for this date' or a coin flip. "
+                   "Prophet is graded next to it. Also called the baseline. It is a simple reference point, not a strong test: "
+                   "being ahead of it is a starting point, not proof of skill."),
+    ("Closing line", "The odds a bookmaker offers just before a match starts, with the bookmaker's margin taken out so the chances add up to 100%. "
+                     "It is the market's final answer, so it is a hard one to be ahead of. Football calls are also graded against Pinnacle's closing line "
+                     "when the data has it. The call itself never uses odds."),
+    ("Brier score", "For a yes or no call: how far the chance was from what happened (1 if it happened, 0 if not), squared. "
+                    "0 is perfect. Always saying 50% scores 0.25. Lower is better."),
+    ("Average miss", "For a number call, such as tomorrow's high: how far off the call was, in the number's own unit (here degrees F), "
+                     "averaged over many calls. Lower is better."),
+    ("Win and miss", "A graded call is a win when Prophet's score beat the lazy guess on that call, and a miss when it did not."),
+    ("Practice run", "A replay of history, one day at a time, using only what was known before each day. A rehearsal, not a track record."),
+    ("Live", f"Calls sealed before their outcome. Only these count as the track record. A domain gets a verdict only after {MIN_CALLS} "
+             "graded calls, with a clear gap over every lazy guess."),
+]
+
+PAGE_CSS = """:root{color-scheme:dark light;--bg:#16162f;--surface:#0b1633;--text:#fdf5ef;--muted:#8d9096;--accent:#deb077;--accent-ink:#deb077;
+--glow:#fedb83;--line:rgba(222,176,119,.24);--soft:rgba(253,245,239,.12);--win-bg:#deb077;--win-fg:#16162f;--lazy:#8d9096;--bad:#fdf5ef}
+@media (prefers-color-scheme:light){:root{--bg:#fdf5ef;--surface:#f4ece7;--text:#16162f;--muted:#62646a;--accent:#ba872a;--accent-ink:#7a5818;
+--glow:#916921;--line:rgba(22,22,47,.18);--soft:rgba(22,22,47,.1);--win-bg:#deb077;--win-fg:#16162f;--lazy:#62646a;--bad:#16162f}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+.wrap{max-width:1120px;margin:0 auto;padding:0 16px}
+a{color:var(--accent-ink)}
+h1,h2,h3,h4,p,dl,dd,ul{margin:0}
+h1,h2,h3,h4{font-weight:600;line-height:1.25}
+small{color:var(--muted);font-weight:400}
+.top{border-bottom:1px dashed var(--line)}
+.top .wrap{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 20px;min-height:56px;padding-top:8px;padding-bottom:8px}
+.mark{font-size:.85rem;font-weight:600;letter-spacing:.32em;text-transform:uppercase}
+.top nav{display:flex;flex-wrap:wrap;gap:6px 18px}
+.top nav a{color:var(--muted);font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;text-decoration:none}
+.top nav a:hover{color:var(--text)}
+.hero{padding:40px 0 8px}
+.eyebrow{color:var(--accent-ink);font-size:.72rem;letter-spacing:.22em;text-transform:uppercase;margin-bottom:10px}
+h1{font-size:clamp(2rem,7vw,3.1rem);letter-spacing:.01em}
+.lede{color:var(--muted);max-width:64ch;margin-top:12px}
+.alert{border:2px solid var(--text);border-radius:12px;padding:14px 16px;margin:20px 0 0;font-weight:600}
+.tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:24px}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px}
+.tile b{display:block;font-size:clamp(1.9rem,7vw,2.8rem);line-height:1.1;font-variant-numeric:tabular-nums}
+.tile span{display:block;margin-top:2px;font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.tile small{display:block;margin-top:6px;font-size:.82rem}
+.proof{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;margin-top:12px}
+.box{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px}
+.box h2{font-size:.72rem;letter-spacing:.2em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.chip{display:inline-block;border:1px solid var(--accent);border-radius:999px;padding:2px 12px;font-size:.82rem;font-weight:600;color:var(--accent-ink)}
+.chip.bad{border-color:var(--text);color:var(--text);background:transparent;text-decoration:underline}
+code,.mono{font:.82rem/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere;word-break:break-all}
+.box p+p{margin-top:8px}
+section.block{padding:40px 0 0}
+section.block>h2{font-size:.78rem;letter-spacing:.22em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+section.block>h2::after{content:"";display:block;width:40px;height:2px;margin-top:10px;background:var(--accent)}
+.intro{color:var(--muted);max-width:70ch;margin:12px 0 18px}
+.boards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,340px),1fr));gap:14px;align-items:start}
+.board{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px}
+.board>h3{font-size:1.15rem;margin-bottom:12px}
+.panel+.panel{margin-top:16px;padding-top:14px;border-top:1px dashed var(--line)}
+.panel>h4{font-size:.72rem;letter-spacing:.18em;text-transform:uppercase;color:var(--accent-ink);margin-bottom:8px}
+.panel>h4 small{letter-spacing:0;text-transform:none;font-size:.8rem;margin-left:6px}
+.metric+.metric{margin-top:14px}
+.label{font-weight:600}
+.label small{display:block;font-size:.8rem}
+.bars{margin:8px 0 6px}
+.bar{display:grid;grid-template-columns:minmax(0,9.5rem) minmax(0,1fr) auto;align-items:center;gap:4px 10px;margin-top:6px;font-size:.88rem}
+.bar .who small{display:block;font-size:.74rem;line-height:1.25}
+.bar .track{height:10px;border-radius:5px;background:var(--soft);overflow:hidden}
+.bar .track i{display:block;height:100%;border-radius:5px}
+.bar.me .track i{background:var(--accent)}
+.bar.lazy .track i{background:repeating-linear-gradient(135deg,var(--lazy) 0 5px,transparent 5px 8px);border:1px solid var(--lazy)}
+.bar b{font-variant-numeric:tabular-nums}
+.meta{color:var(--muted);font-size:.82rem}
+.verdict{display:inline-block;margin-top:6px;border-radius:999px;padding:2px 12px;font-size:.82rem;font-weight:600;border:1px solid var(--soft)}
+.verdict.good{background:var(--win-bg);color:var(--win-fg);border-color:var(--win-bg)}
+.verdict.mid{border:1px solid var(--accent);color:var(--accent-ink)}
+.verdict.bad{border:1px solid var(--text);color:var(--text)}
+.verdict.none{border:1px dashed var(--muted);color:var(--muted)}
+.practice .verdict.good{background:transparent;color:var(--accent-ink);border:1px solid var(--accent)}
+details{margin-top:8px}
+summary{cursor:pointer;color:var(--accent-ink);font-size:.85rem}
+.pairs{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:12px;margin-top:8px}
+.pairs h5{margin:0 0 6px;font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+.pairs ul{padding:0;list-style:none}
+.pairs li{border-left:2px solid var(--accent);padding:2px 0 2px 10px;margin-top:8px;font-size:.88rem}
+.pairs .misses li{border-left:2px dashed var(--muted)}
+.pairs li small{display:block}
+.sbs{display:grid;gap:14px}
+.sbs .box h3{font-size:1rem;margin-bottom:4px}
+.calls{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:14px}
+.call{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:10px}
+.call.win{border-left:4px solid var(--accent)}
+.call.miss{border-left:4px solid var(--muted)}
+.call header{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:6px}
+.dom{font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+.pill{display:inline-block;border-radius:999px;padding:2px 12px;font-size:.78rem;font-weight:600;white-space:nowrap}
+.pill.waiting{border:1px dashed var(--muted);color:var(--muted)}
+.pill.win{background:var(--win-bg);color:var(--win-fg);border:1px solid var(--win-bg)}
+.pill.miss{border:1px solid var(--text);color:var(--text)}
+.pill.tie{border:1px solid var(--muted);color:var(--muted)}
+.q{font-size:.98rem;font-weight:500;line-height:1.4}
+.nums{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.nums div{background:var(--bg);border:1px solid var(--soft);border-radius:10px;padding:8px 10px}
+.nums small{display:block;font-size:.72rem;letter-spacing:.12em;text-transform:uppercase}
+.nums b{display:block;font-size:1.35rem;line-height:1.2;font-variant-numeric:tabular-nums}
+.nums em{display:block;font-style:normal;font-size:.74rem;color:var(--muted);line-height:1.25}
+.res{font-size:.88rem}
+.foot{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;margin-top:auto;color:var(--muted);font-size:.8rem}
+.gloss{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:12px 28px}
+.gloss dt{font-weight:600}
+.gloss dd{color:var(--muted);margin-bottom:4px}
+.gloss code{font-size:.8rem}
+footer{margin-top:48px;border-top:1px dashed var(--line);padding:24px 0 48px;color:var(--muted);font-size:.85rem}
+footer p+p{margin-top:6px}
+@media (max-width:520px){.tiles{gap:8px}.tile{padding:12px}.bar{grid-template-columns:minmax(0,1fr) auto}.bar .track{grid-column:1/-1;order:3}.nums b{font-size:1.2rem}}
+@media (prefers-reduced-motion:no-preference){.call,.board{transition:border-color .2s}.call:hover,.board:hover{border-color:var(--accent)}}
+"""
 
 
-def render_html(blocks: list, now: dt.datetime) -> str:
+def plain_baseline(name) -> str:
+    return PLAIN_BASELINE.get(name, str(name).replace("_", " "))
+
+
+def domain_name(name: str) -> str:
+    if name in DOMAIN_NAMES:
+        return DOMAIN_NAMES[name]
+    ad = REGISTRY.get(name)
+    return ad.title if ad and ad.title else name.replace("_", " ").capitalize() + " (hand-made calls)"
+
+
+def plain_target(ad, domain: str, target: str, kind: str) -> str:
+    if (domain, target) in PLAIN_TARGET:
+        return PLAIN_TARGET[(domain, target)]
+    m = re.fullmatch(r"up_h(\d+)", target)
+    if domain == "markets" and m:
+        h = int(m.group(1))
+        return "Will the index close up tomorrow?" if h == 1 else f"Will the index close up {h} sessions out?"
+    if target == "manual":
+        return "Hand-made calls"
+    return re.sub(r"\s*\((?:Brier|MAE)[^)]*\)\s*$", "", target_label(ad, domain, target, kind))
+
+
+def score_words(kind: str, domain: str, target: str) -> str:
+    if kind == "binary":
+        return "Brier score, lower is better"
+    unit = TARGET_UNIT.get((domain, target))
+    return "average miss" + (f", {unit}" if unit else "") + ", lower is better"
+
+
+def fmt_score(kind: str, x: float) -> str:
+    return f"{x:.3f}" if kind == "binary" else f"{x:.2f}"
+
+
+def fmt_pair(kind: str, a: float, b: float, domain: str, target: str):
+    """Prophet's call and the lazy guess as text: whole percents (one decimal when the whole percents would look equal), or numbers."""
+    if kind == "binary":
+        if round(a * 100) == round(b * 100):
+            return f"{a * 100:.1f}%", f"{b * 100:.1f}%"
+        return f"{a * 100:.0f}%", f"{b * 100:.0f}%"
+    unit = TARGET_UNIT.get((domain, target))
+    tail = " " + unit.replace("degrees F", "&deg;F") if unit else ""
+    return f"{a:.1f}{tail}", f"{b:.1f}{tail}"
+
+
+def record_cards(v: Verification, now: dt.datetime) -> list:
+    """One dict per sealed call that passed verification, joined with its score row (if any)."""
+    scored = valid_scores(v)
+    cards = []
+    for c in v.log.ok_calls:
+        row = scored.get(c["id"])
+        card = {"id": c["id"], "domain": c["domain"], "target": c["target"], "kind": c["kind"], "question": c["question"],
+                "resolves_at": c["resolves_at"], "seal": c["seal"], "pred": c["prediction"], "base": c["baseline_prediction"],
+                "base_name": c.get("primary_baseline") or "baseline", "status": "waiting", "due": parse_iso(c["resolves_at"]) <= now}
+        if row is not None:
+            gap = row["baseline_score"] - row["score"]
+            try:
+                early = parse_iso(row["scored_at"]) < parse_iso(c["resolves_at"])
+            except (KeyError, ValueError):
+                early = False
+            card.update(status="win" if gap > BASELINE_EPS else ("miss" if gap < -BASELINE_EPS else "tie"), gap=gap,
+                        outcome=row["outcome"], score=row["score"], base_score=row["baseline_score"], scored_at=row.get("scored_at", ""), early=early)
+        cards.append(card)
+    return cards
+
+
+def _e(x) -> str:
+    return html.escape(str(x), quote=True)
+
+
+def _rich(text) -> str:
+    """Escaped text in which `backticked` words are shown as code."""
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", _e(text))
+
+
+def _bars(kind: str, prophet: float, lazies: list) -> str:
+    """Prophet's score and each lazy guess's score as bars on one scale (the longest bar is the biggest miss). Lower is better."""
+    top = max([prophet] + [s for _n, s in lazies]) or 1.0
+
+    def bar(who, note, score, cls):
+        width = max(2.0, 100.0 * score / top)
+        return (f'<div class="bar {cls}"><span class="who">{_e(who)}' + (f"<small>{_e(note)}</small>" if note else "") +
+                f'</span><span class="track"><i style="width:{width:.1f}%"></i></span><b>{_e(fmt_score(kind, score))}</b></div>')
+    return ('<div class="bars">' + bar("Prophet", "", prophet, "me")
+            + "".join(bar("The market" if n in MARKET_LINES else "Lazy guess", plain_baseline(n), s, "lazy") for n, s in lazies) + "</div>")
+
+
+def _verdict(code: str, agg: dict | None = None) -> str:
+    words, tone = VERDICT_WORDS.get(code, VERDICT_WORDS["none"])
+    if code == "mixed" and agg and MARKET_LINES & set(agg["baselines"]):       # one of the two reference points is a market price, not a lazy guess
+        words = "Mixed: ahead of one reference point, not the other"
+    return f'<p class="verdict {tone}">{_e(words)}</p>'
+
+
+def unit_html(domain: str, target: str) -> str:
+    unit = TARGET_UNIT.get((domain, target))
+    return " &deg;F" if unit == "degrees F" else (" " + _e(unit) if unit else "")
+
+
+def _examples(items: list, kind: str, domain: str, target: str, questions: dict | None = None, ref: str = "lazy guess") -> str:
+    """Biggest misses next to biggest wins. items come from _example(): key, as_of, called, baseline, outcome, gap.
+    A live call is shown by its question; a practice case, which has none, by its key and day. ref names what Prophet is set beside."""
+    def one(e):
+        text = (questions or {}).get(e["key"]) or f'{e["key"]} ({e["as_of"]})'
+        if len(text) > 150:
+            text = text[:147] + "..."
+        mine, lazy = fmt_pair(kind, e["called"], e["baseline"], domain, target)
+        result = (("It happened." if e["outcome"] >= 0.5 else "It did not happen.") if kind == "binary"
+                  else f'Result {e["outcome"]:g}{unit_html(domain, target)}.')
+        return f"<li>{_e(text)}<small>Prophet {mine}, {ref} {lazy}. {result}</small></li>"
+    return "".join(one(e) for e in items) or "<li><small>none</small></li>"
+
+
+def _practice_panel(ad, name: str, summary, error) -> str:
+    if summary is None:
+        if error:
+            return '<section class="panel practice"><h4>Practice <small>history replay</small></h4><p class="meta">The last practice run failed, so there is nothing to show.</p></section>'
+        return ""
+    out = ['<section class="panel practice"><h4>Practice <small>a rehearsal on past data, not a track record</small></h4>']
+    for tg, agg in summary["targets"].items():
+        kind = agg["kind"]
+        lazies = [(n, b["score"]) for n, b in list(agg["baselines"].items())[:3]]
+        ref = "the market" if agg.get("primary") in MARKET_LINES else "lazy guess"
+        out.append('<div class="metric">'
+                   f'<p class="label">{_e(plain_target(ad, name, tg, kind))}<small>{_e(score_words(kind, name, tg))}</small></p>'
+                   + _bars(kind, agg["score"], lazies) + _verdict(agg["verdict_code"], agg) +
+                   f'<p class="meta">{agg["n"]:,} practice calls, {_e(str(agg["first"])[:10])} to {_e(str(agg["last"])[:10])}</p>')
+        if agg.get("misses_worst") or agg.get("wins_best"):
+            out.append('<details><summary>Biggest misses and wins in the practice run</summary><div class="pairs">'
+                       f'<div class="misses"><h5>Biggest misses</h5><ul>{_examples(agg.get("misses_worst", []), kind, name, tg, ref=ref)}</ul></div>'
+                       f'<div><h5>Biggest wins</h5><ul>{_examples(agg.get("wins_best", []), kind, name, tg, ref=ref)}</ul></div></div></details>')
+        out.append("</div>")
+    return "".join(out) + "</section>"
+
+
+def _live_panel(ad, name: str, groups: list) -> str:
+    head = '<section class="panel"><h4>Live <small>sealed before the outcome: the track record</small></h4>'
+    if not groups:
+        if ad is None or ad.status != "ready":                  # not running: the scoreboard says so in one line instead of showing an empty card
+            return ""
+        if not ad.can_predict:
+            return head + '<p class="meta">This kind of question is practice only. It makes no live calls.</p></section>'
+        return head + f'<p class="meta">No live call yet. Make some with <code>prophet lab predict {_e(name)}</code>.</p></section>'
+    out = [head]
+    for tg, g in groups:
+        kind, agg = g["kind"], g["agg"]
+        when = f" Next result due {_e(iso(g['next_due'])[:10])}." if g["next_due"] else ""
+        out.append('<div class="metric">'
+                   f'<p class="label">{_e(plain_target(ad, name, tg, kind))}<small>{_e(score_words(kind, name, tg))}</small></p>')
+        if agg["n"]:
+            out.append(_bars(kind, agg["score"], [(n, b["score"]) for n, b in list(agg["baselines"].items())[:3]]))
+        out.append(_verdict(agg["verdict_code"], agg) +
+                   f'<p class="meta">{g["sealed"]} sealed, {agg["n"]} graded, {g["waiting"]} waiting' +
+                   (f" ({g['overdue']} past their date)" if g["overdue"] else "") + f".{when}</p></div>")
+    return "".join(out) + "</section>"
+
+
+def _call_card(c: dict) -> str:
+    kind = c["kind"]
+    mine, lazy = fmt_pair(kind, c["pred"], c["base"], c["domain"], c["target"])
+    status = c["status"]
+    if status == "waiting":
+        pill, word = "waiting", ("Past its date, no result yet" if c["due"] else "Waiting")
+    else:
+        pill, word = status, {"win": "Graded: win", "miss": "Graded: miss", "tie": "Graded: tie"}[status]
+    out = [f'<article class="call {status}"><header><span class="dom">{_e(domain_name(c["domain"]))}</span>'
+           f'<span class="pill {pill}">{_e(word)}</span></header>',
+           f'<h3 class="q">{_e(c["question"])}</h3>',
+           f'<div class="nums"><div><small>Prophet</small><b>{mine}</b></div>'
+           f'<div><small>Lazy guess</small><b>{lazy}</b><em>{_e(plain_baseline(c["base_name"]))}</em></div></div>']
+    if status != "waiting":
+        early = " (graded before its date)" if c["early"] else ""
+        if kind == "binary":
+            happened = "It happened." if c["outcome"] >= 0.5 else "It did not happen."
+            out.append(f'<p class="res">{happened} Brier score {_e(fmt_score(kind, c["score"]))} against '
+                       f'{_e(fmt_score(kind, c["base_score"]))} for the lazy guess{early}.</p>')
+        else:
+            out.append(f'<p class="res">Result: {c["outcome"]:g}{unit_html(c["domain"], c["target"])}. Prophet missed by {c["score"]:.2f}; '
+                       f'the lazy guess missed by {c["base_score"]:.2f}{early}.</p>')
+    out.append(f'<p class="foot"><span>Resolves {_e(c["resolves_at"][:10])}</span><span title="{_e(c["seal"])}">Seal {_e(c["seal"][:12])}</span></p></article>')
+    return "".join(out)
+
+
+def render_page(lab: Lab, v: Verification, live: dict, cards: list, now: dt.datetime) -> str:
+    """The record page. Every number comes from the sealed files; nothing here is typed by hand."""
+    anchor = anchor_state(lab, v)
+    n_sealed = len(cards)
+    n_graded = sum(1 for c in cards if c["status"] != "waiting")
+    n_wait = n_sealed - n_graded
+    n_due = sum(1 for c in cards if c["status"] == "waiting" and c["due"])
+    questions = {c["id"]: c["question"] for c in cards}
+    head = v.log.head
+    seals_ok = v.ok
     out = ["<!doctype html>", '<html lang="en"><head><meta charset="utf-8">',
-           '<meta name="viewport" content="width=device-width,initial-scale=1">', "<title>Prophet Pattern Lab</title>",
-           f"<style>{HTML_CSS}</style></head><body><main>"]
-    for b in blocks:
-        if b[0] == "h1":
-            out.append(f"<h1>{html.escape('Prophet Pattern Lab')}</h1>")
-        elif b[0] == "h2":
-            out.append(f"<h2>{html.escape(b[1])}</h2>")
-        elif b[0] == "p":
-            out.append(f"<p>{html.escape(b[1])}</p>")
-        elif b[0] == "pre":
-            out.append(f"<pre>{html.escape(b[1])}</pre>")
-        elif b[0] == "table":
-            t = ['<div class="wrap"><table><thead><tr>' + "".join(f"<th>{html.escape(str(h))}</th>" for h in b[1]) + "</tr></thead><tbody>"]
-            t += ["<tr>" + "".join(f"<td>{html.escape(str(c))}</td>" for c in r) + "</tr>" for r in b[2]]
-            t.append("</tbody></table></div>")
-            out.append("".join(t))
-    out.append(f"<p>Generated {html.escape(iso(now))}. Pattern research only: no bets, no trades, no advice.</p></main></body></html>")
+           '<meta name="viewport" content="width=device-width,initial-scale=1">', '<meta name="color-scheme" content="dark light">',
+           "<title>Prophet: the record</title>",
+           '<meta name="description" content="Predictions written down before they happen, locked with a seal, and graded against the obvious guess.">',
+           f"<style>{PAGE_CSS}</style></head><body>",
+           '<header class="top"><div class="wrap"><span class="mark">Prophet</span><nav aria-label="Sections">'
+           '<a href="#scoreboard">Scoreboard</a><a href="#sidebyside">Wins and misses</a><a href="#calls">Calls</a><a href="#words">Words</a></nav></div></header>',
+           '<main class="wrap"><section class="hero"><p class="eyebrow">A receipt book for predictions</p><h1>The record</h1>'
+           "<p class=\"lede\">Each call is written down before it happens, locked with a seal, then graded against the lazy guess. "
+           "This page is built from the sealed files. Nobody edits it by hand.</p>"]
+    if not seals_ok:
+        out.append('<p class="alert" role="alert">TAMPERED. A seal or a score does not match. Do not trust this record until the cause is found '
+                   "(run <code>prophet lab verify</code>).</p>")
+    out.append(f'<div class="tiles"><div class="tile"><b>{n_sealed}</b><span>Sealed</span></div>'
+               f'<div class="tile"><b>{n_graded}</b><span>Graded</span></div>'
+               f'<div class="tile"><b>{n_wait}</b><span>Waiting</span>' +
+               (f"<small>{n_due} past their date</small>" if n_due else "") + "</div></div>")
+    if n_sealed == 0:
+        out.append('<p class="intro">Nothing is sealed yet. Make the first call: <code>prophet lab call --domain demo --question "Will my die roll '
+                   'show a 5 or a 6?" --resolves today --prob 0.33</code></p>')
+    out.append('<div class="proof"><div class="box"><h2>Seals</h2>'
+               f'<p><span class="chip{"" if seals_ok else " bad"}">{"All seals OK" if seals_ok else "TAMPERED"}</span></p>'
+               f'<p class="meta">{len(v.log.entries)} sealed calls checked, {len(v.log.bad)} tampered. {len(v.scores)} score rows, {len(v.score_problems)} problems.</p>'
+               f'<p class="meta">Chain head, the seal of the newest call:</p><p class="mono">{_e(head or "(nothing sealed yet)")}</p></div>'
+               f'<div class="box"><h2>Anchor</h2><p>{_rich(anchor_sentence(anchor))}</p></div></div></section>')
+    # ---- scoreboard: one card per domain, practice and live apart
+    boards, quiet = [], []
+    for name in ordered_domains(live):
+        ad = REGISTRY.get(name)
+        summary, error = read_summary(lab, name)
+        groups = sorted(((t, g) for (d, t), g in live["groups"].items() if d == name), key=lambda x: x[0])
+        body = _live_panel(ad, name, groups) + _practice_panel(ad, name, summary, error)         # the track record first, the rehearsal second
+        if body:
+            boards.append(f'<article class="board"><h3>{_e(domain_name(name))}</h3>{body}</article>')
+        elif ad is not None:
+            quiet.append(f"{domain_name(name)} ({ad.status.replace('_', ' ')})")
+    out.append('<section class="block" id="scoreboard"><h2>Scoreboard</h2>'
+               '<p class="intro">Prophet next to the lazy guess, one card per kind of question. Live calls and practice runs are kept apart on purpose: '
+               f"only live calls are a track record, and nothing is claimed before {MIN_CALLS} graded calls. "
+               "A lazy guess is a simple reference point, not a strong test.</p>"
+               '<div class="boards">' + ("".join(boards) or '<p class="meta">No practice run and no call yet.</p>') + "</div>")
+    if quiet:
+        out.append('<p class="meta" style="margin-top:12px">Not running: ' + _e(", ".join(quiet)) + '. <code>prophet lab domains</code> says why.</p>')
+    out.append("</section>")
+    # ---- wins and misses side by side (live calls only)
+    out.append('<section class="block" id="sidebyside"><h2>Wins and misses, side by side</h2>')
+    sbs = []
+    for (name, tg), g in sorted(live["groups"].items()):
+        graded = [c for c in cards if c["domain"] == name and c["target"] == tg and c["status"] != "waiting"]
+        if not graded:
+            continue
+        ad = REGISTRY.get(name)
+        ranked = sorted(graded, key=lambda c: c["gap"])
+        miss = [{"key": c["id"], "as_of": c["resolves_at"][:10], "called": c["pred"], "baseline": c["base"], "outcome": c["outcome"]} for c in ranked if c["gap"] < 0][:3]
+        win = [{"key": c["id"], "as_of": c["resolves_at"][:10], "called": c["pred"], "baseline": c["base"], "outcome": c["outcome"]} for c in ranked[::-1] if c["gap"] > 0][:3]
+        sbs.append(f'<div class="box"><h3>{_e(domain_name(name))}: {_e(plain_target(ad, name, tg, g["kind"]))}</h3>'
+                   f'<div class="pairs"><div class="misses"><h5>Biggest misses</h5><ul>{_examples(miss, g["kind"], name, tg, questions)}</ul></div>'
+                   f'<div><h5>Biggest wins</h5><ul>{_examples(win, g["kind"], name, tg, questions)}</ul></div></div></div>')
+    if sbs:
+        out.append('<div class="sbs">' + "".join(sbs) + "</div>")
+    else:
+        out.append('<p class="intro">No live call has been graded yet, so there are no wins or misses to show. '
+                   "When results arrive, the biggest misses will sit here next to the biggest wins. Practice-run examples are inside each scoreboard card.</p>")
+    out.append("</section>")
+    # ---- the calls
+    graded_cards = sorted((c for c in cards if c["status"] != "waiting"), key=lambda c: c.get("scored_at", ""), reverse=True)
+    waiting_cards = sorted((c for c in cards if c["status"] == "waiting"), key=lambda c: c["resolves_at"])
+    limit = 150
+    out.append('<section class="block" id="calls"><h2>Calls</h2>')
+    for title, group, empty in (("Graded", graded_cards, "No call has been graded yet."), ("Waiting for the result", waiting_cards, "No call is waiting.")):
+        out.append(f'<h3 style="margin:18px 0 10px;font-size:1rem">{title} <small>({len(group)})</small></h3>')
+        if group:
+            out.append('<div class="calls">' + "".join(_call_card(c) for c in group[:limit]) + "</div>")
+            if len(group) > limit:
+                out.append(f'<p class="meta">Showing {limit} of {len(group)}. The whole list is calls.jsonl.</p>')
+        else:
+            out.append(f'<p class="meta">{empty}</p>')
+    out.append("</section>")
+    # ---- words and footer
+    out.append('<section class="block" id="words"><h2>Words used here</h2><dl class="gloss">' +
+               "".join(f"<div><dt>{_e(t)}</dt><dd>{_rich(d)}</dd></div>" for t, d in GLOSSARY) + "</dl></section></main>")
+    out.append(f'<footer><div class="wrap"><p>Generated {_e(iso(now))} by prophet_lab.py from calls.jsonl, scores.jsonl, backtest/ and anchors.jsonl. '
+               f"Code sha256 {_e(code_sha()[:16])}.</p>"
+               "<p>Pattern research only. Prophet places no bets or trades and gives no betting, trading or investment advice.</p></div></footer>"
+               "</body></html>")
     return "\n".join(out) + "\n"
 
 
@@ -2210,13 +3123,12 @@ def cmd_record(lab, args):
     v = verify_lab(lab)
     live = live_state(lab, v)
     blocks = build_blocks(lab, live, now)
-    md, page = render_md(lab, blocks), render_html(blocks, now)
+    md, page = render_md(lab, blocks), render_page(lab, v, live, record_cards(v, now), now)
     atomic_write(lab.root / "RECORD.md", md)
     atomic_write(lab.root / "record.html", page)
     print(f"Wrote {lab.root / 'RECORD.md'} ({len(md)} bytes) and {lab.root / 'record.html'} ({len(page)} bytes)")
     print(f"Integrity: {len(v.log.entries)} sealed calls, {len(v.log.bad)} TAMPERED; " + ("ALL SEALS OK" if v.ok else "TAMPERED, see `verify`"))
     return 0 if v.ok else 1
-
 
 # ======================================================================================
 # command line
@@ -2228,42 +3140,51 @@ def build_parser():
     common.add_argument("--lab-dir", default=argparse.SUPPRESS, help="data folder (default: the pattern-lab notebook folder)")
     common.add_argument("--calls", default=argparse.SUPPRESS, help="use this calls.jsonl instead of the lab's own (for checks on a copy)")
     common.add_argument("--scores", default=argparse.SUPPRESS, help="use this scores.jsonl instead of the lab's own")
-    common.add_argument("--refresh", action="store_true", default=argparse.SUPPRESS, help="download again even if a recent copy is cached")
+    common.add_argument("--refresh", action="store_true", default=argparse.SUPPRESS, help="download again even if a recent copy is cached (a GDELT day that is already counted is never downloaded again)")
+    common.add_argument("--days", type=int, default=argparse.SUPPRESS, help="geopolitics: days of GDELT daily event files to use, ending yesterday (default 120, at least 40)")
+    common.add_argument("--gdelt-doc-api", action="store_true", default=argparse.SUPPRESS, help="geopolitics: use the old GDELT DOC API (it often answers HTTP 429) instead of the daily event files")
     common.add_argument("--debug", action="store_true", default=argparse.SUPPRESS, help="show full error traces")
     p = argparse.ArgumentParser(prog="prophet lab", parents=[common], formatter_class=argparse.RawDescriptionHelpFormatter,
-                                description="Prophet Pattern Lab: pattern calls sealed before the outcome, scored against reality and a plain baseline.\n"
+                                description="Prophet Pattern Lab: make the call, lock it in, get graded. Calls are sealed before the outcome and graded against "
+                                            "reality and the lazy guess (a plain baseline).\n"
+                                            "Never touches the network: call, resolve, list, verify, record, domains. Downloads public data: backtest, predict, score.\n"
+                                            "Sends one 32-byte hash to two OpenTimestamps servers: anchor (anchor --dry-run sends nothing).\n"
                                             "Pattern research only. No bets, no trades, no advice. Free public data, no keys.",
-                                epilog='examples:\n  prophet lab backtest all\n  prophet lab predict weather\n  prophet lab score\n'
+                                epilog='examples:\n  prophet lab call --domain demo --question "Will my die roll show a 5 or a 6?" --resolves today --prob 0.33\n'
                                        '  prophet lab call --domain politics --question "Will X happen by 2026-12-31?" --resolves 2026-12-31 --prob 0.62\n'
-                                       "  prophet lab resolve <id> --outcome yes\n  prophet lab verify\n  prophet lab record")
+                                       "  prophet lab resolve <id> --outcome yes\n  prophet lab verify\n  prophet lab record\n  prophet lab anchor --dry-run\n"
+                                       "  prophet lab backtest all\n  prophet lab predict weather\n  prophet lab score")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
 
     def add(name, helptext, func):
         sp = sub.add_parser(name, parents=[common], help=helptext, description=helptext)
         sp.set_defaults(func=func)
         return sp
-    s = add("backtest", "replay history walk-forward and score it (rehearsal, not a track record)", cmd_backtest)
+    s = add("backtest", "practice run: replay history walk-forward and score it (a rehearsal, not a track record). Downloads public data", cmd_backtest)
     s.add_argument("domain", help="a domain name, or all")
-    s = add("predict", "seal live pattern calls for things that have not happened yet", cmd_predict)
+    s = add("predict", "seal live pattern calls for things that have not happened yet. Downloads public data", cmd_predict)
     s.add_argument("domain", help="a domain name, or all")
-    add("score", "score sealed calls whose outcome is now in the data", cmd_score)
-    s = add("call", "seal a hand-made or agent-made call on any question", cmd_call)
+    add("score", "score sealed calls whose outcome is now in the data. Downloads public data", cmd_score)
+    s = add("call", "seal a hand-made or agent-made call on any question (never touches the network)", cmd_call)
     s.add_argument("--domain", required=True, help="any name, for example politics or business")
     s.add_argument("--question", required=True)
-    s.add_argument("--resolves", required=True, help="date the answer will be known, YYYY-MM-DD")
+    s.add_argument("--resolves", required=True, help="date the answer will be known, YYYY-MM-DD, or the word today or tomorrow (UTC dates)")
     s.add_argument("--prob", type=float, help="probability of yes, 0 to 1")
     s.add_argument("--value", type=float, help="a number, instead of --prob")
     s.add_argument("--baseline", type=float, help="what a plain guess says (default 0.5 for yes/no; required for numbers)")
     s.add_argument("--method", default="manual call", help="how the call was made, for example 'agent: reasoning from X'")
     s.add_argument("--source", action="append", help="a URL the call relied on (recorded, not downloaded); repeatable")
     s.add_argument("--target", help="a label inside the domain (default manual)")
-    s = add("resolve", "score a hand-made call once the answer is known", cmd_resolve)
+    s = add("resolve", "score a hand-made call once the answer is known (never touches the network)", cmd_resolve)
     s.add_argument("id")
     s.add_argument("--outcome", required=True, help="yes, no, or a number")
     s.add_argument("--evidence", help="URL or note showing the outcome")
     s.add_argument("--note")
     add("verify", "check every seal and the hash chain; broken ones are reported as TAMPERED", cmd_verify)
-    add("record", "write RECORD.md and record.html", cmd_record)
+    add("record", "write RECORD.md and record.html (the record page), from the sealed files only", cmd_record)
+    s = add("anchor", "send the chain head (a 32-byte hash, nothing else) to two OpenTimestamps servers, so the date can be proved later", cmd_anchor)
+    s.add_argument("--dry-run", action="store_true", help="show what would be sent and where; send nothing and write nothing")
+    s.add_argument("--again", action="store_true", help="send a chain head that was already anchored a second time")
     add("domains", "list domains, their status and free data sources", cmd_domains)
     s = add("list", "list sealed calls", cmd_list)
     s.add_argument("--open", action="store_true", help="only calls without a score")
@@ -2281,7 +3202,8 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         lab = Lab(root=getattr(args, "lab_dir", None), calls=getattr(args, "calls", None), scores=getattr(args, "scores", None),
-                  ttl_hours=0.0 if getattr(args, "refresh", False) else 6.0)
+                  ttl_hours=0.0 if getattr(args, "refresh", False) else 6.0,
+                  opts={k: getattr(args, k) for k in ("days", "gdelt_doc_api") if hasattr(args, k)})
         return int(args.func(lab, args) or 0)
     except (LabError, FetchError) as e:
         print(f"error: {e}", file=sys.stderr)

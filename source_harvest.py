@@ -1,6 +1,6 @@
-"""Prophet source harvester: pulls the approved, verified, keyless sources of the Prophet source registry into local
-searchable notebooks that `ask` reads (ask -c sources-<area> <question>). Local files only: no keys, no accounts, no
-paid calls, no GPU, no model.
+"""Prophet source harvester: downloads the approved, verified, keyless public sources of the Prophet source registry into
+local searchable notebooks that `ask` reads (ask -c sources-<area> <question>). It uses the network (that is its job;
+--list does not) and writes local files only. No keys, no accounts, no paid calls, no GPU, no model.
 
   python -B source_harvest.py --area all                    everything approved (and the optional local God's Eye View clone, if gods_eye_view points at one)
   python -B source_harvest.py --area film_craft --limit 10  one area, at most 10 items per source
@@ -97,7 +97,29 @@ COLUMN_HINTS = {
     "api_coinbase_candles": ["time", "low", "high", "open", "close", "volume"],
     "csv_gdelt_lastupdate": ["size_bytes", "md5", "url"],
     "csv_meteostat_bulk": ["date", "tavg", "tmin", "tmax", "prcp", "snow", "wdir", "wspd", "wpgt", "pres", "tsun"],
+    # GDELT 1.0 event table, the 58 tab-separated columns of a daily export (no header row in the file)
+    "csv_gdelt_v1_daily_events": [
+        "GLOBALEVENTID", "SQLDATE", "MonthYear", "Year", "FractionDate",
+        "Actor1Code", "Actor1Name", "Actor1CountryCode", "Actor1KnownGroupCode", "Actor1EthnicCode", "Actor1Religion1Code",
+        "Actor1Religion2Code", "Actor1Type1Code", "Actor1Type2Code", "Actor1Type3Code",
+        "Actor2Code", "Actor2Name", "Actor2CountryCode", "Actor2KnownGroupCode", "Actor2EthnicCode", "Actor2Religion1Code",
+        "Actor2Religion2Code", "Actor2Type1Code", "Actor2Type2Code", "Actor2Type3Code",
+        "IsRootEvent", "EventCode", "EventBaseCode", "EventRootCode", "QuadClass", "GoldsteinScale", "NumMentions", "NumSources",
+        "NumArticles", "AvgTone",
+        "Actor1Geo_Type", "Actor1Geo_FullName", "Actor1Geo_CountryCode", "Actor1Geo_ADM1Code", "Actor1Geo_Lat", "Actor1Geo_Long",
+        "Actor1Geo_FeatureID",
+        "Actor2Geo_Type", "Actor2Geo_FullName", "Actor2Geo_CountryCode", "Actor2Geo_ADM1Code", "Actor2Geo_Lat", "Actor2Geo_Long",
+        "Actor2Geo_FeatureID",
+        "ActionGeo_Type", "ActionGeo_FullName", "ActionGeo_CountryCode", "ActionGeo_ADM1Code", "ActionGeo_Lat", "ActionGeo_Long",
+        "ActionGeo_FeatureID",
+        "DATEADDED", "SOURCEURL"],
 }
+# A zip member bigger than this is refused (it would be read whole). The cap is the same for every source but the ones listed in
+# STREAM_HEAD_SOURCES: a GDELT day unzips to about 50 MB of text, so for that source the member is streamed instead, its first lines are
+# kept and all lines are counted, and only that small summary is harvested.
+ZIP_MEMBER_CAP = 40_000_000
+ZIP_STREAM_CAP = 1_000_000_000      # even a streamed member is refused if the zip says it unpacks to more than this
+STREAM_HEAD_SOURCES = {"csv_gdelt_v1_daily_events": 400}      # source id -> how many lines to keep
 csv.field_size_limit(10 ** 7)
 
 
@@ -1048,8 +1070,31 @@ def record_items(src, records, limit, api_url):
 
 
 # ----------------------------------------------------------------------------------------------- tables (CSV and friends)
-def unpack_text(data, url):
-    """Text of a CSV/TXT payload that may be a zip or gzip file."""
+def stream_head(zf, info, head_lines):
+    """(text of the first head_lines lines, note) of a zip member too big to read whole. It is read 1 MB at a time; every line is counted."""
+    if info.file_size > ZIP_STREAM_CAP:
+        raise FetchError("zip member %s unpacks to more than %d bytes" % (info.filename, ZIP_STREAM_CAP), kind="parse")
+    kept, total, tail = [], 0, b""
+    with zf.open(info) as member:
+        while True:
+            chunk = member.read(1 << 20)
+            if not chunk:
+                break
+            pieces = (tail + chunk).split(b"\n")
+            tail = pieces.pop()
+            total += len(pieces)
+            kept.extend(pieces[:max(0, head_lines - len(kept))])
+    if tail:
+        total += 1
+        kept.extend([tail][:max(0, head_lines - len(kept))])
+    text = "\n".join(piece.decode("utf-8", "replace").rstrip("\r") for piece in kept) + "\n"
+    return text, "unzipped member %s (%.1f MB, over the %d MB cap, so only its first %d of %s lines were read)" % (
+        info.filename, info.file_size / 1e6, ZIP_MEMBER_CAP // 1_000_000, len(kept), format(total, ","))
+
+
+def unpack_text(data, url, head_lines=None):
+    """Text of a CSV/TXT payload that may be a zip or gzip file. A zip member over ZIP_MEMBER_CAP is refused, unless head_lines is
+    given (the sources in STREAM_HEAD_SOURCES): then only its first head_lines lines are kept and the lines are counted."""
     note = ""
     if data[:4] == b"PK\x03\x04":
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -1058,8 +1103,10 @@ def unpack_text(data, url):
                 raise FetchError("zip file is empty: " + url, kind="parse")
             names.sort(key=lambda i: (not i.filename.lower().endswith((".csv", ".txt")), -i.file_size))
             chosen = names[0]
-            if chosen.file_size > 40_000_000:
-                raise FetchError("zip member %s is larger than 40 MB" % chosen.filename, kind="parse")
+            if chosen.file_size > ZIP_MEMBER_CAP:
+                if not head_lines:
+                    raise FetchError("zip member %s is larger than 40 MB" % chosen.filename, kind="parse")
+                return stream_head(zf, chosen, head_lines)
             data = zf.read(chosen)
             note = "unzipped member " + chosen.filename
     elif data[:2] == b"\x1f\x8b":
@@ -1353,7 +1400,7 @@ def fetch_csv(http, src, limit):
     packed = resp.body[:4] in (b"PK\x03\x04",) or resp.body[:2] == b"\x1f\x8b"
     if resp.truncated and packed:
         raise FetchError("compressed file larger than the 12 MB cap, not read: " + url, kind="parse")
-    text, note = unpack_text(resp.body, url)
+    text, note = unpack_text(resp.body, url, STREAM_HEAD_SOURCES.get(src["id"]))
     if text.lstrip()[:1] == "<":
         raise FetchError("expected a data table but received markup: %r" % text.lstrip()[:60], kind="parse")
     try:

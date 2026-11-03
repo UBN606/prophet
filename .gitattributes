@@ -5,3 +5,5 @@
 *.md text eol=lf
 prophet text eol=lf
 *.cmd text eol=crlf
+*.png binary
+*.webp binary
